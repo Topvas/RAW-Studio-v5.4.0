@@ -47,7 +47,7 @@ import sys
 import numpy as np
 
 APP_AUTHOR = "Vaskov Yaroslav, CIT PROGRAM LLC"
-APP_VERSION = "4.8.0"
+APP_VERSION = "5.4.0"
 # -- Спектр із зображення: оцифрування PNG/JPEG графіка (v3.8.0) --
 def _rgb_hue(px):
     """Відтінок (0…1) для масиву RGB (N,3)."""
@@ -896,15 +896,17 @@ def jam_quality_params(sig_key, sdr_key, pa_dbm=20.0, dist_km=5.0, dj_km=1.0,
 
 WAVE_KINDS = ["Синус", "Меандр", "Трикутник", "Імпульс", "Шум", "GNSS L1",
               "GPS L1", "Galileo E1", "ГЛОНАСС G1", "BeiDou B1", "Mesh COFDM",
-              "Завада CW", "Завада (шум)", "Завада (чирп)", "Spoofing GPS"]
+              "Завада CW", "Завада (шум)", "Завада (чирп)", "Spoofing GPS",
+              "Завада RGPO", "Завада VGPO"]
 KIND_KEY = {"Синус": "sine", "Меандр": "square", "Трикутник": "tri",
             "Імпульс": "pulse", "Шум": "noise", "GNSS L1": "gnss_l1",
             "GPS L1": "gps_l1", "Galileo E1": "gal_e1",
             "ГЛОНАСС G1": "glo_g1", "BeiDou B1": "bds_b1", "Mesh COFDM": "mesh",
             "Завада CW": "jam_cw", "Завада (шум)": "jam_noise",
-            "Завада (чирп)": "jam_chirp", "Spoofing GPS": "spoof"}
+            "Завада (чирп)": "jam_chirp", "Завада RGPO": "jam_rgpo",
+            "Завада VGPO": "jam_vgpo", "Spoofing GPS": "spoof"}
 GNSS_KEYS = ("gnss_l1", "gps_l1", "gal_e1", "glo_g1", "bds_b1")
-JAM_KEYS = ("jam_cw", "jam_noise", "jam_chirp")
+JAM_KEYS = ("jam_cw", "jam_noise", "jam_chirp", "jam_rgpo", "jam_vgpo")
 QAM_MAP = {"Адаптивна (BPSK…1024QAM)": 0, "BPSK": 1, "QPSK": 2, "16QAM": 4,
            "64QAM": 6, "256QAM": 8, "1024QAM": 10}
 
@@ -1361,7 +1363,7 @@ def make_mesh(n, fs, freq, amp, rng, per_us=200.0, pw_us=100.0, bw_hz=10e6, qam_
 
 
 def make_jam(kind_key, n, fs, freq, amp, phase_deg, rng,
-             bw_hz=20e6, sweep_hz=5e6, sweep_per_us=1000.0):
+             bw_hz=20e6, sweep_hz=5e6, sweep_per_us=1000.0, shape=None):
     """Моделі завад (глушилок) для випробувань CRPA (TGTX5050A, v3.3.0):
     jam_cw — неперервна несуча (спот-глушилка);
     jam_noise — широкосмуговий barrage-шум: смуга bw_hz навколо несучої
@@ -1382,8 +1384,24 @@ def make_jam(kind_key, n, fs, freq, amp, phase_deg, rng,
         W = np.fft.rfft(w)
         f = np.fft.rfftfreq(n, 1.0 / fs)
         f0 = min(max(float(freq), bw / 2.0), fs / 2.0 - bw / 2.0)
-        mask = (f >= f0 - bw / 2.0) & (f <= f0 + bw / 2.0)
-        W[~mask] = 0.0
+        if shape is not None:
+            # спектрально-формований шум (v4.9.0): профіль спектра запису
+            if isinstance(shape, str):
+                shape = load_spectrum_profile(shape)
+            fr = np.asarray(shape.get("freqs_hz"), float)
+            pd = np.asarray(shape.get("psd_db"), float)
+            fcr = float(shape.get("fc") or 0.0)
+            if fcr <= 0 and fr.size:
+                fcr = float((fr[0] + fr[-1]) / 2.0)
+            off_r = np.abs(fr - fcr)
+            order = np.argsort(off_r)
+            gain = 10.0 ** (pd[order] / 20.0)
+            gmax = float(gain.max()) if gain.size and float(gain.max()) > 0 else 1.0
+            gain = gain / gmax
+            W = W * np.interp(np.abs(f - f0), off_r[order], gain, left=0.0, right=0.0)
+        else:
+            mask = (f >= f0 - bw / 2.0) & (f <= f0 + bw / 2.0)
+            W[~mask] = 0.0
         w = np.fft.irfft(W, n)
         s = float(np.std(w))
         if s > 0:
@@ -1396,6 +1414,82 @@ def make_jam(kind_key, n, fs, freq, amp, phase_deg, rng,
     inst = freq - dev + 2.0 * dev * u
     phase = two_pi * np.cumsum(inst) / fs + ph0
     return amp * np.sin(phase)
+
+
+def make_rgpo(n, fs, freq, amp, phase_deg, rng,
+              per_us=1000.0, pw_us=50.0, v_pull=300.0, d_max_us=1000.0):
+    """RGPO — затягування по дальності (v5.0.0): радіоімпульсна репліка цілі
+    (період per_us, тривалість pw_us — поля «Кроку 3»), затримка k-ї репліки
+    росте лінійно: t_k = k·PRI·(1 + 2v/c) — дальномір цілі «йде» за хибною
+    цілю. Після досягнення d_max репліка зникає (walk-off-then-drop).
+    0 у полях = типові: PRI 1000 мкс, імпульс 50 мкс, v 300 м/с, d_max 1000 мкс."""
+    if freq <= 0:
+        return np.zeros(n)
+    pri = float(per_us if per_us and float(per_us) > 0 else 1000.0) * 1e-6
+    pw = float(pw_us if pw_us and float(pw_us) > 0 else 50.0) * 1e-6
+    v = float(v_pull) if v_pull and float(v_pull) > 0 else 300.0
+    d_max = float(d_max_us if d_max_us and float(d_max_us) > 0 else 1000.0) * 1e-6
+    rate = 2.0 * v / 3e8
+    w = np.zeros(n)
+    ph0 = math.radians(phase_deg)
+    k = 0
+    while k < 1000000:
+        tau = k * pri * (1.0 + rate)
+        if k * pri * rate > d_max:
+            break
+        i0 = int(round(tau * fs))
+        if i0 >= n:
+            break
+        i1 = min(i0 + max(int(round(pw * fs)), 1), n)
+        tt = np.arange(i1 - i0) / fs
+        w[i0:i1] += amp * np.sin(2 * np.pi * freq * (tau + tt) + ph0)
+        k += 1
+    return w
+
+
+def make_vgpo(n, fs, freq, amp, phase_deg, rng,
+              fd_max_khz=30.0, t_pull_s=2.0):
+    """VGPO — затягування по швидкості (v5.0.0): репліка несучої з доплерівським
+    зсувом, що росте лінійно 0 → fd_max за час t_pull (фаза = інтеграл зсуву),
+    після досягнення максимуму репліка зникає (drop).
+    0 у полях = типові: fd 30 кГц, t_pull 2 с."""
+    if freq <= 0:
+        return np.zeros(n)
+    fd = float(fd_max_khz if fd_max_khz and float(fd_max_khz) > 0 else 30.0) * 1e3
+    T = float(t_pull_s) if t_pull_s and float(t_pull_s) > 0 else 2.0
+    t = np.arange(n) / fs
+    ph = (2 * np.pi * freq * t
+          + 2 * np.pi * (fd / (2.0 * T)) * np.minimum(t, T) ** 2
+          + math.radians(phase_deg))
+    w = amp * np.sin(ph)
+    w[t > T] = 0.0
+    return w
+
+
+def parse_protected_mhz(s):
+    """Рядок захищених частот → список діапазонів (lo, hi) у Гц (v5.0.0).
+    Формат: «1575.42, 2412-2472» (МГц; голе число — діапазон ±2.5 МГц
+    навколо несучої, «а-б» — діапазон)."""
+    out = []
+    for tok in str(s or "").replace(";", ",").split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        if "-" in tok:
+            a, b = tok.split("-", 1)
+            lo, hi = parse_freq_hz(a), parse_freq_hz(b)
+            if hi < lo:
+                lo, hi = hi, lo
+            out.append((lo, hi))
+        else:
+            f = parse_freq_hz(tok)
+            out.append((max(f - 2.5e6, 0.0), f + 2.5e6))
+    return out
+
+
+def is_protected(f_hz, prot):
+    """Чи частота f_hz (Гц) потрапляє у захищені діапазони (v5.0.0)."""
+    return any(lo <= float(f_hz) <= hi for lo, hi in (prot or ()))
 
 
 def make_spoof(n, fs, freq, amp, phase_deg, rng, f_off=500.0, f_drift=10.0):
@@ -1447,7 +1541,8 @@ def make_wave(kind_key, n, fs, freq, phase_deg, amp, width_us, rng):
 def make_wave_ext(kind_key, n, fs, freq, phase_deg, amp, width_us, rng,
                   per_us=0.0, pw_us=0.0, rise_us=0.0, fall_us=0.0,
                   am_m=0.0, am_f=0.0, chirp_dev=0.0, chirp_per_us=0.0, qam_bits=0.0,
-                  jam_bw=0.0, sp_off=0.0, sp_drift=0.0):
+                  jam_bw=0.0, sp_off=0.0, sp_drift=0.0, jam_shape=None,
+                  rgpo_v=0.0, rgpo_d=0.0, vgpo_f=0.0, vgpo_t=0.0):
     """Розширені форми: радіоімпульси (період слідування, фронти), АМ, ЛЧМ.
     Амплітуда/фаза — базові; тут додаткові параметри сигналів."""
     t = np.arange(n) / fs
@@ -1459,9 +1554,16 @@ def make_wave_ext(kind_key, n, fs, freq, phase_deg, amp, width_us, rng,
     elif kind_key == "mesh":
         w = make_mesh(n, fs, freq, amp, rng, per_us=per_us, pw_us=pw_us, bw_hz=chirp_dev,
                       qam_bits=qam_bits)
+    elif kind_key == "jam_rgpo":
+        w = make_rgpo(n, fs, freq, amp, phase_deg, rng,
+                      per_us=per_us, pw_us=pw_us, v_pull=rgpo_v, d_max_us=rgpo_d)
+    elif kind_key == "jam_vgpo":
+        w = make_vgpo(n, fs, freq, amp, phase_deg, rng,
+                      fd_max_khz=vgpo_f, t_pull_s=vgpo_t)
     elif kind_key in JAM_KEYS:
         w = make_jam(kind_key, n, fs, freq, amp, phase_deg, rng,
-                     bw_hz=jam_bw, sweep_hz=chirp_dev, sweep_per_us=chirp_per_us)
+                     bw_hz=jam_bw, sweep_hz=chirp_dev, sweep_per_us=chirp_per_us,
+                     shape=jam_shape)
     elif kind_key == "spoof":
         w = make_spoof(n, fs, freq, amp, phase_deg, rng,
                        f_off=sp_off, f_drift=sp_drift)
@@ -1553,11 +1655,12 @@ def generate_raw(ch_params, n_samples, fs, nch, seed=42, achx=None, extra=None):
         ex = p.get("extra") if p.get("extra") is not None else (extra or {})
         w = p.get("samples")
         if w is None:
-            if p.get("kind") == "Mesh COFDM" or (
-                    ex and any(float(ex.get(k) or 0) != 0 for k in
+            if p.get("kind") in ("Mesh COFDM", "Завада RGPO", "Завада VGPO") or (
+                    ex and (ex.get("jam_shape") or any(float(ex.get(k) or 0) != 0 for k in
                                ("per_us", "pw_us", "rise_us", "fall_us", "am_m", "am_f",
                                 "chirp_dev", "chirp_per_us", "qam_bits", "jam_bw",
-                                "sp_off", "sp_drift"))):
+                                "sp_off", "sp_drift", "rgpo_v", "rgpo_d",
+                                "vgpo_f", "vgpo_t")))):
                 w = make_wave_ext(KIND_KEY[p["kind"]], n, fs, p["freq"], p["phase"],
                                   p["amp"], p["width_us"], rng,
                                   per_us=ex.get("per_us", 0), pw_us=ex.get("pw_us", 0),
@@ -1568,7 +1671,12 @@ def generate_raw(ch_params, n_samples, fs, nch, seed=42, achx=None, extra=None):
                                   qam_bits=ex.get("qam_bits", 0),
                                   jam_bw=ex.get("jam_bw", 0),
                                   sp_off=ex.get("sp_off", 0),
-                                  sp_drift=ex.get("sp_drift", 0))
+                                  sp_drift=ex.get("sp_drift", 0),
+                                  jam_shape=ex.get("jam_shape"),
+                                  rgpo_v=ex.get("rgpo_v", 0),
+                                  rgpo_d=ex.get("rgpo_d", 0),
+                                  vgpo_f=ex.get("vgpo_f", 0),
+                                  vgpo_t=ex.get("vgpo_t", 0))
             else:
                 w = make_wave(KIND_KEY[p["kind"]], n, fs, p["freq"], p["phase"],
                               p["amp"], p["width_us"], rng)
@@ -2709,6 +2817,726 @@ def plan_channels(bw_hz=CHANNEL_BW):
     return out
 
 
+
+def fspl_free_db(f_hz, d_km):
+    """Затухання у вільному просторі (FSPL), дБ: 92.45 + 20lg(f_ГГц) + 20lg(d_км) (v5.1.0)."""
+    f_ghz = max(float(f_hz) / 1e9, 1e-6)
+    d = max(float(d_km), 1e-4)
+    return 92.45 + 20.0 * math.log10(f_ghz) + 20.0 * math.log10(d)
+
+
+def coverage_radius_km(eirp_dbm, thresh_dbm, f_hz, g_ant_db=0.0, g_rx_db=0.0):
+    """Максимальна дальність завади, км (v5.1.0): EIRP + G(кут) + G_rx - FSPL(d) >= поріг."""
+    f_ghz = max(float(f_hz) / 1e9, 1e-6)
+    m = (float(eirp_dbm) + float(g_ant_db) + float(g_rx_db) - float(thresh_dbm)
+         - 92.45 - 20.0 * math.log10(f_ghz))
+    return max(10.0 ** (m / 20.0), 0.0)
+
+
+def coverage_map(eirp_dbm, thresh_dbm, f_hz, ant_name="", hpb=60.0, fbr=20.0,
+                 g_rx_db=0.0, n_pts=181):
+    """Мапа покриття (v5.1.0): (кути 0..360 град, дальності км) - G(кут) з моделі пелюстки
+    ant_pattern_db, r(кут) = coverage_radius_km(EIRP, поріг, f, G(кут), G_rx)."""
+    degs = np.linspace(0.0, 360.0, int(n_pts))
+    g = np.array([ant_pattern_db(ant_name or "Інший (власноруч)", float(d),
+                                 hpb=hpb, fbr=fbr) for d in degs])
+    rs = np.array([coverage_radius_km(eirp_dbm, thresh_dbm, f_hz,
+                                      g_ant_db=float(gi), g_rx_db=g_rx_db) for gi in g])
+    return degs, rs
+
+
+def coverage_metric(rows, ref_db=None):
+    """Метрика покриття плану завад (v5.1.0): rows = [(f_Гц, bw_Гц, ампл_кодів)].
+    Повертає dict: pct - % діапазону плану, вкритого хоч однією завадою;
+    holes - список (lo, hi) дір усередині діапазону; js - J/S по каналах
+    (20lg(ампл, кодів) - рівень сигналу, дБ)."""
+    bands = []
+    for f, bw, _a in rows:
+        f, bw = float(f), abs(float(bw))
+        if f > 0 and bw > 0:
+            bands.append((f - bw / 2.0, f + bw / 2.0))
+    js = [20.0 * math.log10(max(abs(float(a)), 1.0)) - float(ref_db)
+          if ref_db is not None else 0.0 for _f, _bw, a in rows]
+    if not bands:
+        return {"pct": 0.0, "holes": [], "js": js}
+    bands.sort()
+    merged, cur = [], list(bands[0])
+    for lo, hi in bands[1:]:
+        if lo <= cur[1]:
+            cur[1] = max(cur[1], hi)
+        else:
+            merged.append(tuple(cur))
+            cur = [lo, hi]
+    merged.append(tuple(cur))
+    span = merged[-1][1] - merged[0][0]
+    covered = sum(hi - lo for lo, hi in merged)
+    pct = 100.0 * covered / span if span > 0 else 0.0
+    holes = [(h0, l1) for (l0, h0), (l1, h1) in zip(merged, merged[1:]) if l1 - h0 > 1e-6]
+    return {"pct": pct, "holes": holes, "js": js}
+
+
+def build_pdf_report(path, params, metric=None, map_png=None, spec_png=None, meta=None,
+                     spec3d=None, map3d=None, vs3d=None):
+    """Звіт плану завад у PDF (v5.3.0): титулка, таблиця каналів, метрика покриття,
+    спектр каналів, мапа покриття і 3D-графіки (3D-спектрограма, «Завада vs ціль»,
+    3D-мапа покриття — входи-словники, рендеряться у PNG автоматично).
+    Шрифт DejaVuSans (кирилиця) вбудовується у файл."""
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.units import mm
+    from reportlab.lib import colors as _rlc
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer, Table,
+                                    TableStyle, Image as RLImage)
+    _fnt = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+    _fntb = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+    if not os.path.exists(_fnt):
+        raise RuntimeError("немає шрифту DejaVuSans для PDF")
+    pdfmetrics.registerFont(TTFont("DejaVu", _fnt))
+    if os.path.exists(_fntb):
+        pdfmetrics.registerFont(TTFont("DejaVu-Bold", _fntb))
+    st_h = ParagraphStyle("h", fontName="DejaVu-Bold", fontSize=15, leading=19)
+    st_t = ParagraphStyle("t", fontName="DejaVu", fontSize=9, leading=12)
+    _style = TableStyle([
+        ("FONTNAME", (0, 0), (-1, -1), "DejaVu"),
+        ("FONTNAME", (0, 0), (-1, 0), "DejaVu-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 8),
+        ("GRID", (0, 0), (-1, -1), 0.4, _rlc.Color(0.6, 0.6, 0.6)),
+        ("BACKGROUND", (0, 0), (-1, 0), _rlc.Color(0.85, 0.88, 0.95))])
+    import datetime as _dt
+    story = [Paragraph("RAW Studio v%s - звіт плану завад" % APP_VERSION, st_h), Spacer(1, 4),
+             Paragraph("Дата: %s%s" % (_dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
+                                       (" - " + str(meta)) if meta else ""), st_t),
+             Spacer(1, 10)]
+    _rows = [["№", "Увімк", "Форма", "Частота, МГц", "Ампл., кодів",
+              "Ширина, мкс", "DC", "Підсилення"]]
+    for _i, _p in enumerate(params):
+        if not _p.get("enabled"):
+            continue
+        _rows.append([str(_i), "так", _p.get("kind", ""),
+                      "%.4g" % (float(_p.get("freq", 0)) / 1e6),
+                      "%.6g" % float(_p.get("amp", 0)), "%.6g" % float(_p.get("width_us", 0)),
+                      "%.6g" % float(_p.get("dc", 0)), "%.6g" % float(_p.get("gain", 0))])
+    _t1 = Table(_rows, hAlign="LEFT")
+    _t1.setStyle(_style)
+    story += [Paragraph("Канали плану завад", st_h), Spacer(1, 3), _t1, Spacer(1, 10)]
+    if metric:
+        story.append(Paragraph("Метрика покриття: %.1f%%" % float(metric.get("pct", 0.0)), st_h))
+        story.append(Spacer(1, 3))
+        _rows2 = [["№", "J/S, дБ"]]
+        for _i, _v in enumerate(metric.get("js", [])):
+            _rows2.append(["ch%d" % _i, "%+.1f" % float(_v)])
+        for _lo, _hi in metric.get("holes", []):
+            _rows2.append(["діра", "%.4g-%.4g МГц" % (_lo / 1e6, _hi / 1e6)])
+        _t2 = Table(_rows2, hAlign="LEFT")
+        _t2.setStyle(_style)
+        story += [_t2, Spacer(1, 10)]
+    if spec3d:
+        try:
+            _p53 = render_spec3d_png("/tmp/opencode/rs53_spec3d.png",
+                                     spec3d.get("raw_path", ""),
+                                     float(spec3d.get("fs_hz", 8e6)),
+                                     nch=int(spec3d.get("nch", 1)),
+                                     ch=int(spec3d.get("ch", 0)),
+                                     nfft=int(spec3d.get("nfft", 1024)))
+        except Exception:
+            _p53 = None
+        if _p53:
+            spec3d = dict(spec3d)
+            spec3d["_png"] = _p53
+    if map3d:
+        try:
+            _p53 = render_map3d_png("/tmp/opencode/rs53_map3d.png",
+                                    float(map3d.get("eirp_dbm", 50.0)),
+                                    float(map3d.get("thresh_dbm", -85.0)),
+                                    float(map3d.get("f_hz", 2.4e9)),
+                                    ant_name=str(map3d.get("ant_name", "")),
+                                    hpb=float(map3d.get("hpb", 60.0)),
+                                    fbr=float(map3d.get("fbr", 20.0)),
+                                    g_rx_db=float(map3d.get("g_rx_db", 0.0)))
+        except Exception:
+            _p53 = None
+        if _p53:
+            map3d = dict(map3d)
+            map3d["_png"] = _p53
+    if vs3d:
+        try:
+            _p53 = render_vs3d_png("/tmp/opencode/rs53_vs3d.png",
+                                   vs3d.get("raw_path", ""),
+                                   float(vs3d.get("fs_hz", 8e6)),
+                                   nch=int(vs3d.get("nch", 1)),
+                                   ch=int(vs3d.get("ch", 0)),
+                                   jam_f_hz=float(vs3d.get("jam_f_hz", 0.0)),
+                                   jam_bw_hz=float(vs3d.get("jam_bw_hz", 20e6)),
+                                   js_db=float(vs3d.get("js_db", 15.0)))
+        except Exception:
+            _p53 = None
+        if _p53:
+            vs3d = dict(vs3d)
+            vs3d["_png"] = _p53
+    for _png, _cap in ((spec_png, "Спектр каналів плану"),
+                       (map_png, "Мапа покриття (полярна x FSPL)"),
+                       ((spec3d or {}).get("_png"), "3D-спектрограма запису (час x частота x рівень)"),
+                       ((vs3d or {}).get("_png"), "Завада vs ціль (3D): перекриття смуги"),
+                       ((map3d or {}).get("_png"), "3D-мапа покриття (кут x дальність)")):
+        if _png and os.path.exists(_png):
+            try:
+                from PIL import Image as _PImg
+                _w, _h = _PImg.open(_png).size
+                story += [Paragraph(_cap, st_t),
+                          RLImage(_png, width=150 * mm,
+                                  height=150 * mm * float(_h) / float(_w)),
+                          Spacer(1, 8)]
+            except Exception:
+                pass
+    SimpleDocTemplate(path, pagesize=A4,
+                      title="RAW Studio - звіт плану завад").build(story)
+    return path
+
+
+def scenario_parse_phases(obj):
+    """Фази сценарію (v5.2.0): [{"t": с, "ch": "0,1"|[0,1], "v": м/с, "d": км}, ...]
+    або рядки "t:ch"; повертає [{"t", "ch", "v", "d"}, ...]."""
+    out = []
+    items = obj if isinstance(obj, list) else str(obj).split(";")
+    for it in items:
+        if isinstance(it, dict):
+            t = float(it.get("t", 0))
+            c = it.get("ch", "")
+            ch = ([int(x) for x in str(c).replace(" ", "").split(",") if x != ""]
+                  if isinstance(c, str) else [int(x) for x in c])
+            v = float(it.get("v", 0) or 0)
+            d = float(it.get("d", 0) or 0)
+        elif isinstance(it, str):
+            t_s, c = (it.split(":", 1) + [""])[:2]
+            t = float(t_s.strip())
+            ch = [int(x) for x in c.replace(" ", "").split(",") if x != ""]
+            v = 0.0
+            d = 0.0
+        else:
+            continue
+        if t > 0:
+            out.append({"t": t, "ch": ch, "v": v, "d": d})
+    return out
+
+
+def scenario_build_raw(out_path, phases, ch_params, fs, seed=42, extra=None, achx=None):
+    """Генерує сценарій (v5.2.0): фази послідовно у часі, у кожній фазі активні
+    лише канали ch (хвилі підсумовуються в один моно-канал). Фаза може нести
+    рух: "v" (м/с) — доплерівський зсув несучих f·(1+v/c), "d" (км) —
+    ослаблення дальності (амплітуда × 1/d відн. 1 км)."""
+    segs, tot = [], 0
+    for ph in phases:
+        n_ph = int(round(float(ph["t"]) * float(fs)))
+        if n_ph <= 0:
+            segs.append(np.zeros(0))
+            continue
+        acc = np.zeros(n_ph)
+        v = float(ph.get("v", 0) or 0)
+        dist = float(ph.get("d", 0) or 0)
+        for ci in ph["ch"]:
+            if ci < 0 or ci >= len(ch_params):
+                continue
+            p = dict(ch_params[ci])
+            p["enabled"] = True
+            p.setdefault("dc", 32768.0)
+            if v:
+                p["freq"] = float(p.get("freq", 0.0)) * (1.0 + v / 299792458.0)
+            if dist > 0:
+                p["amp"] = float(p.get("amp", 0.0)) / max(dist, 1e-3)
+            w = generate_raw([p], n_ph, fs, 1, seed + ci, achx=achx, extra=extra)
+            acc = acc + w.astype(np.float64) - float(p.get("dc", 32768.0))
+        segs.append(acc)
+        tot += n_ph
+    if tot * 8 > 2e9:
+        raise ValueError("занадто великий сценарій: %d відліків" % tot)
+    full = (np.clip(np.concatenate(segs) + 32768.0, 0, 65535).astype("<u2")
+            if segs else np.zeros(0, dtype="<u2"))
+    save_raw(out_path, full)
+    return out_path, tot
+
+
+def save_spectrum_profile(path, freqs_hz, psd_db, fc):
+    """Профіль спектра запису для спектрально-формованого шуму (v4.9.0):
+    JSON {freqs_hz, psd_db, fc} поруч із .iq — створюється автоматично
+    кнопкою «Аналізувати» у вікні «Завада з IQ»."""
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump({"freqs_hz": [float(v) for v in freqs_hz],
+                   "psd_db": [float(v) for v in psd_db],
+                   "fc": float(fc)}, fh)
+    return path
+
+
+def load_spectrum_profile(path):
+    """Читає профіль .spectrum.json -> dict(freqs_hz, psd_db (np), fc)."""
+    with open(path, "r", encoding="utf-8") as fh:
+        d = json.load(fh)
+    return {"freqs_hz": np.asarray(d.get("freqs_hz") or [], float),
+            "psd_db": np.asarray(d.get("psd_db") or [], float),
+            "fc": float(d.get("fc") or 0.0)}
+
+
+def _chan_column(path, nch=1, ch=0, max_samples=1 << 22):
+    """Відліки одного каналу з .raw (u2, канали черезвідліково), без DC (v5.2.0)."""
+    if not (0 <= ch < nch):
+        raise ValueError("канал № %d поза діапазоном 0…%d" % (ch, nch - 1))
+    data = np.fromfile(path, dtype="<u2")
+    if data.size == 0:
+        raise ValueError("порожній файл: %s" % path)
+    n = min(data.size // nch, int(max_samples))
+    col = data[:n * nch].reshape(n, nch).astype(np.float64)[:, ch]
+    return col - 32768.0
+
+
+def _psd_mean(x, fs, nfft=4096, nseg=32):
+    """Усереднений періодограмний спектр, дБ відн. повної шкали (v5.2.0)."""
+    x = np.asarray(x, dtype=np.float64)
+    if x.size < nfft * 2:
+        raise ValueError("мало відліків для спектра: %d (NFFT %d)" % (x.size, nfft))
+    m = (x.size // nfft) * nfft
+    segs = x[:m].reshape(-1, nfft)[:max(1, int(nseg))]
+    win = np.hanning(nfft)
+    cg = win.mean()
+    F = np.abs(np.fft.rfft((segs - segs.mean(axis=1, keepdims=True)) * win,
+                           axis=1)) / (float(nfft) * cg)
+    psd = 20.0 * np.log10(F.mean(axis=0) + 1e-12)
+    return np.fft.rfftfreq(nfft, d=1.0 / float(fs)), psd
+
+
+def jam_overlap(target_lo_hz, target_hi_hz, jam_f_hz, jam_bw_hz, jam_shape="noise"):
+    """Перекриття смуги завади зі смугою цілі (v5.2.0): dict(pct, f_lo, f_hi) —
+    % смуги цілі, накритої завадою; для CW смуга = ±25 кГц, інакше ±BW/2."""
+    t_lo, t_hi = float(target_lo_hz), float(target_hi_hz)
+    if str(jam_shape).lower() == "cw":
+        j_lo, j_hi = float(jam_f_hz) - 25e3, float(jam_f_hz) + 25e3
+    else:
+        j_lo, j_hi = float(jam_f_hz) - float(jam_bw_hz) / 2.0, float(jam_f_hz) + float(jam_bw_hz) / 2.0
+    lo, hi = max(t_lo, j_lo), min(t_hi, j_hi)
+    ov = max(0.0, hi - lo)
+    pct = min(100.0 * ov / max(t_hi - t_lo, 1e-9), 100.0)
+    return {"pct": pct, "f_lo": (lo if ov > 0 else None), "f_hi": (hi if ov > 0 else None)}
+
+
+def ab_compare(path_a, path_b, fs_hz, nch=1, ch=0, nfft=4096):
+    """Порівняння двох записів .raw (v5.2.0): усереднені спектри на спільній
+    сітці, пік A, дельта B-A у смузі піка (-20 дБ). Повертає dict(freqs,
+    psd_a, psd_b, f_hz, bw_hz, a_db, b_db, delta_db)."""
+    fa, pa = _psd_mean(_chan_column(path_a, nch, ch), fs_hz, nfft)
+    fb, pb = _psd_mean(_chan_column(path_b, nch, ch), fs_hz, nfft)
+    i = int(np.argmax(pa))
+    thr = pa[i] - 20.0
+    j = i
+    while j > 0 and pa[j] > thr:
+        j -= 1
+    k = i
+    while k < pa.size - 1 and pa[k] > thr:
+        k += 1
+    prom_a = float(pa[i] - float(np.median(pa)))
+    ib = int(np.argmax(pb))
+    prom_b = float(pb[ib] - float(np.median(pb)))
+    return {"freqs": fa, "psd_a": pa, "psd_b": pb,
+            "f_hz": float(fa[i]), "bw_hz": float(fa[k] - fa[j]),
+            "a_db": float(pa[j:k + 1].max()), "b_db": float(pb[j:k + 1].max()),
+            "delta_db": float(pb[j:k + 1].max() - pa[j:k + 1].max()),
+            "prom_a_db": prom_a, "prom_b_db": prom_b,
+            "suppress_db": prom_a - prom_b}
+
+
+def pri_analyze(x, fs, thr_ratio=0.15):
+    """PRI/тривалість імпульсів (v5.2.0): огинаюча |x| з усередненням ~1 мкс,
+    поріг thr_ratio від максимуму. Повертає dict(pri_us, pw_us, n_pulses, jit_us)."""
+    x = np.asarray(x, dtype=np.float64)
+    if x.size < 64:
+        raise ValueError("мало відліків для PRI-аналізу: %d" % x.size)
+    env = np.abs(x - float(np.median(x)))
+    k = max(3, 2 * int(round(float(fs) * 1e-6)) + 1)
+    env = np.convolve(env, np.ones(k) / float(k), mode="same")
+    thr = float(env.max()) * float(thr_ratio)
+    above = env > thr
+    d = np.diff(above.astype(np.int8))
+    ups = np.where(d == 1)[0] + 1
+    dns = np.where(d == -1)[0] + 1
+    if above[0]:
+        dns = dns[1:]
+    if above[-1]:
+        ups = ups[:-1]
+    n = min(ups.size, dns.size)
+    if n < 2:
+        raise ValueError("імпульси не знайдено (поріг %.0f%%)" % (float(thr_ratio) * 100.0))
+    ipi = np.diff(ups[:n])
+    _pw_n = max(1.0, float(np.median(dns[:n] - ups[:n])) - float(k - 1))
+    return {"pri_us": float(np.median(ipi)) / float(fs) * 1e6,
+            "pw_us": _pw_n / float(fs) * 1e6,
+            "n_pulses": int(n),
+            "jit_us": float(np.std(ipi)) / float(fs) * 1e6}
+
+
+def demod_audio(x, fs, mode="fm", fm_dev_hz=75000.0, decim=1):
+    """Демодуляція комплексного каналу в аудіо int16 (v5.2.0): mode "fm" —
+    мгновенна частота (нормування на девіацію), "am" — огинаюча. Декімація
+    простим усередненням (аудіо 8-48 кГц)."""
+    z = np.asarray(x)
+    if not np.iscomplexobj(z):
+        z = z.astype(np.complex128)
+    if str(mode).lower() in ("fm", "чм"):
+        ph = np.unwrap(np.angle(z))
+        a = np.concatenate([np.diff(ph) * float(fs) / (2.0 * np.pi)
+                            / max(float(fm_dev_hz), 1.0), [0.0]])
+    else:
+        a = np.abs(z)
+        a = a / max(float(np.percentile(a, 99.0)), 1e-9) - 0.5
+    a = np.clip(a, -1.0, 1.0)
+    d = max(1, int(decim))
+    if d > 1:
+        a = a[: (a.size // d) * d].reshape(-1, d).mean(axis=1)
+    return (a * 32000.0).astype(np.int16)
+
+
+def save_wav_int16(path, samples, rate):
+    """Запис моно-WAV 16 біт (v5.2.0)."""
+    import wave
+    with wave.open(path, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(int(rate))
+        w.writeframes(np.asarray(samples, dtype=np.int16).tobytes())
+    return path
+
+
+def power_optimize(js_db, thresh_dbm, f_hz, dist_km, g_ant_db, g_rx_db,
+                   jam_bw_hz, sig_bw_hz):
+    """Оптимізатор потужності (v5.2.0): мінімальна потужність ПП (дБм) для
+    заданого J/S на дальності: P = J/S + поріг + FSPL - G_ант - G_rx
+    + 10lg(BW_завади/BW_сигналу) — корекція розподілу шумової потужності.
+    Повертає dict(p_req_dbm, eirp_dbm, fspl_db, corr_db)."""
+    fpl = fspl_free_db(float(f_hz), float(dist_km))
+    corr = 10.0 * math.log10(max(float(jam_bw_hz), 1.0) / max(float(sig_bw_hz), 1.0))
+    p = (float(js_db) + float(thresh_dbm) + fpl
+         - float(g_ant_db) - float(g_rx_db) + corr)
+    return {"p_req_dbm": p, "eirp_dbm": p + float(g_ant_db),
+            "fspl_db": fpl, "corr_db": corr}
+
+
+def coverage_map3d(eirp_dbm, thresh_dbm, f_hz, ant_name="", hpb=60.0, fbr=20.0,
+                   g_rx_db=0.0, n_ang=73, n_rad=60, r_max_km=0.0):
+    """3D-мапа покриття (v5.2.0): сітка запасу над порогом (дБ) кут×дальність.
+    Повертає (angs_deg, rads_km, margin_db[кут, дальність])."""
+    r0 = coverage_radius_km(float(eirp_dbm), float(thresh_dbm), float(f_hz),
+                            g_ant_db=float(g_rx_db))
+    rmax = float(r_max_km) if float(r_max_km) > 0 else max(r0 * 1.6, 1.0)
+    rads = np.linspace(max(rmax / float(n_rad), 1e-3), rmax, int(n_rad))
+    angs = np.linspace(0.0, 360.0, int(n_ang))
+    M = np.empty((angs.size, rads.size), dtype=np.float64)
+    fpl0 = 92.45 + 20.0 * math.log10(float(f_hz) / 1e9)
+    for i, a in enumerate(angs):
+        g = float(ant_pattern_db(ant_name, float(a), float(hpb), float(fbr)))
+        M[i] = (float(eirp_dbm) + g - fpl0
+                - 20.0 * np.log10(rads) - float(thresh_dbm) - float(g_rx_db))
+    return angs, rads, M
+
+
+SCENARIO_PRESETS = [
+    {"name": "FPV/дрон-лінк 5.8 ГГц — шум, 2 фази",
+     "desc": "Фаза 0: шум 20 МГц на 5800 МГц, 10 с; фаза 1: спостереження (пауза), 5 с",
+     "phases": [{"t": 10, "ch": [0], "v": 0, "d": 2}, {"t": 5, "ch": [], "v": 0, "d": 0}]},
+    {"name": "Захист конвою 433 МГц — рух завади",
+     "desc": "Завада супроводжує колону: доплер від руху (30 м/с), дальність росте 1→2→4 км",
+     "phases": [{"t": 15, "ch": [0], "v": 30, "d": 1}, {"t": 15, "ch": [0], "v": 30, "d": 2},
+                {"t": 15, "ch": [0], "v": 30, "d": 4}]},
+    {"name": "GNSS L1 — спуфінг по фазах",
+     "desc": "Фаза 0: чистий прийом (канал 0); фаза 1: спуфер вмикається разом із прийомом",
+     "phases": [{"t": 20, "ch": [0], "v": 0, "d": 0}, {"t": 30, "ch": [0, 1], "v": 0, "d": 0}]},
+    {"name": "Обхід дір плану — покрокове глушіння",
+     "desc": "4 фази по каналах 0→1→2→3 — «прасування» дір метрики покриття",
+     "phases": [{"t": 5, "ch": [0], "v": 0, "d": 0}, {"t": 5, "ch": [1], "v": 0, "d": 0},
+                {"t": 5, "ch": [2], "v": 0, "d": 0}, {"t": 5, "ch": [3], "v": 0, "d": 0}]},
+]
+
+
+def batch_scan(dirpath, fs_hz, nch=1, ch=0, nfft=4096, max_files=200):
+    """Батч-аналіз теки .raw (v5.2.0): для кожного файлу — відліки, топ-пік
+    (частота, ширина за -20 дБ, рівень над медіаною). Повертає список
+    dict(name, n_samples, f_hz, width_hz, peak_rel_db[, error])."""
+    if not os.path.isdir(dirpath):
+        raise ValueError("тека не знайдена: %s" % dirpath)
+    out = []
+    for fn in sorted(os.listdir(dirpath)):
+        if not fn.lower().endswith(".raw"):
+            continue
+        if len(out) >= int(max_files):
+            break
+        pth = os.path.join(dirpath, fn)
+        try:
+            col = _chan_column(pth, nch, ch, max_samples=1 << 21)
+            fr, psd = _psd_mean(col, fs_hz, nfft)
+            i = int(np.argmax(psd))
+            thr = psd[i] - 20.0
+            j = i
+            while j > 0 and psd[j] > thr:
+                j -= 1
+            k = i
+            while k < psd.size - 1 and psd[k] > thr:
+                k += 1
+            out.append({"name": fn, "n_samples": int(col.size),
+                        "f_hz": float(fr[i]), "width_hz": float(fr[k] - fr[j]),
+                        "peak_rel_db": float(psd[i] - float(np.median(psd)))})
+        except Exception as e:
+            out.append({"name": fn, "n_samples": 0, "f_hz": 0.0,
+                        "width_hz": 0.0, "peak_rel_db": 0.0, "error": str(e)})
+    return out
+
+
+def batch_save_csv(path, rows):
+    """CSV-зведення батч-аналізу (v5.2.0), роздільник ';' (Excel-сумісний)."""
+    import csv
+    with open(path, "w", encoding="utf-8-sig", newline="") as fh:
+        w = csv.writer(fh, delimiter=";")
+        w.writerow(["файл", "відліків", "пік, Гц", "ширина, Гц", "рівень, дБ", "помилка"])
+        for r in rows:
+            w.writerow([r.get("name", ""), r.get("n_samples", 0),
+                        "%.6g" % r.get("f_hz", 0.0), "%.6g" % r.get("width_hz", 0.0),
+                        "%.2f" % r.get("peak_rel_db", 0.0), r.get("error", "")])
+    return path
+
+
+def render_spec3d_png(out_png, raw_path, fs_hz, nch=1, ch=0, nfft=1024, overlap=0.5):
+    """3D-спектрограма .raw у PNG (v5.3.0, для звіту PDF). Повертає шлях або None."""
+    try:
+        fr, tm, db, note = raw_spectrogram(raw_path, fs_hz, nch=nch, ch=ch,
+                                           nfft=nfft, overlap=overlap)
+    except Exception:
+        return None
+    import matplotlib as _M53
+    _M53.rcParams["font.family"] = "DejaVu Sans"
+    from matplotlib.figure import Figure as _F53
+    fg = _F53(figsize=(6.6, 4.4), dpi=110)
+    ax = fg.add_subplot(111, projection="3d")
+    Tm, Fm = np.meshgrid(tm, fr / 1e6)
+    ax.plot_surface(Tm, Fm, db, cmap="viridis",
+                    rstride=max(1, db.shape[0] // 120),
+                    cstride=max(1, db.shape[1] // 120), linewidth=0, antialiased=True)
+    ax.set_xlabel("Час, мс")
+    ax.set_ylabel("Частота, МГц")
+    ax.set_zlabel("дБ")
+    ax.set_title("3D-спектрограма: %s (канал %d)" % (os.path.basename(raw_path), ch), fontsize=9)
+    fg.tight_layout()
+    fg.savefig(out_png)
+    return out_png
+
+
+def render_map3d_png(out_png, eirp_dbm, thresh_dbm, f_hz, ant_name="", hpb=60.0,
+                     fbr=20.0, g_rx_db=0.0):
+    """3D-мапа покриття у PNG (v5.3.0, для звіту PDF). Повертає шлях."""
+    angs, rads, M = coverage_map3d(float(eirp_dbm), float(thresh_dbm), float(f_hz),
+                                   ant_name=ant_name, hpb=hpb, fbr=fbr, g_rx_db=g_rx_db)
+    import matplotlib as _M53
+    _M53.rcParams["font.family"] = "DejaVu Sans"
+    from matplotlib.figure import Figure as _F53
+    fg = _F53(figsize=(6.6, 4.6), dpi=110)
+    ax = fg.add_subplot(111, projection="3d")
+    A, R = np.meshgrid(angs, rads)
+    ax.plot_surface(A, R, M.T, cmap="viridis", linewidth=0, antialiased=True)
+    ax.set_xlabel("Кут, °")
+    ax.set_ylabel("Дальність, км")
+    ax.set_zlabel("Запас, дБ")
+    ax.set_title("3D-мапа покриття: EIRP %.1f дБм, поріг %.0f дБм" % (float(eirp_dbm), float(thresh_dbm)),
+                 fontsize=9)
+    fg.tight_layout()
+    fg.savefig(out_png)
+    return out_png
+
+
+def render_vs3d_png(out_png, raw_path, fs_hz, nch=1, ch=0, jam_f_hz=0.0, jam_bw_hz=20e6,
+                    js_db=15.0):
+    """«Завада vs ціль (3D)» у PNG (v5.3.0, для звіту PDF). None якщо файл не читається."""
+    try:
+        fr, psd = _psd_mean(_chan_column(raw_path, nch, ch, max_samples=1 << 21), fs_hz, 4096)
+    except Exception:
+        return None
+    i = int(np.argmax(psd))
+    thr = psd[i] - 20.0
+    j = i
+    while j > 0 and psd[j] > thr:
+        j -= 1
+    k = i
+    while k < psd.size - 1 and psd[k] > thr:
+        k += 1
+    ov = jam_overlap(float(fr[j]), float(fr[k]), jam_f_hz, jam_bw_hz)
+    tgt = psd - psd.max()
+    jm = np.where((fr >= jam_f_hz - jam_bw_hz / 2.0) & (fr <= jam_f_hz + jam_bw_hz / 2.0),
+                  float(js_db), -80.0)
+    import matplotlib as _M53
+    _M53.rcParams["font.family"] = "DejaVu Sans"
+    from matplotlib.figure import Figure as _F53
+    fg = _F53(figsize=(6.6, 4.6), dpi=110)
+    ax = fg.add_subplot(111, projection="3d")
+    Ff, Yy = np.meshgrid(fr / 1e6, np.array([0.0, 1.0]))
+    ax.plot_surface(Ff, Yy, np.tile(tgt, (2, 1)), color="#3a7bd5", alpha=0.9, linewidth=0)
+    Ff2, Yy2 = np.meshgrid(fr / 1e6, np.array([2.2, 3.2]))
+    ax.plot_surface(Ff2, Yy2, np.tile(jm, (2, 1)), color="#d9534f", alpha=0.75, linewidth=0)
+    if ov["f_lo"] is not None:
+        Fo, Yo = np.meshgrid(np.array([ov["f_lo"] / 1e6, ov["f_hi"] / 1e6]),
+                             np.array([1.0, 2.2]))
+        Zo = np.array([[float(tgt.min()), float(tgt.min())], [float(js_db), float(js_db)]])
+        ax.plot_surface(Fo, Yo, Zo, color="#f0ad4e", alpha=0.35, linewidth=0)
+    ax.set_xlabel("Частота, МГц")
+    ax.set_ylabel("ціль / завада")
+    ax.set_zlabel("дБ")
+    ax.set_title("Завада vs ціль: перекриття %.0f%%, J/S %+.0f дБ" % (ov["pct"], float(js_db)),
+                 fontsize=9)
+    fg.tight_layout()
+    fg.savefig(out_png)
+    return out_png
+
+
+FIBER_MODEMS = [
+    {"name": "Міні-TOSA/ROSA 155 Мбіт/с, 1310 нм (до 20 км)", "lam_nm": 1310, "rate_mbps": 155,
+     "reach_km": 20, "laser": "FP", "p_tx_dbm": -12.0, "sens_dbm": -28.0, "overload_dbm": -8.0,
+     "clock_mhz": 24.576, "conn": "пайка / FC", "note": "малий габарит — база дешевих ОВ-дронів"},
+    {"name": "SFP 1.25G SX, 850 нм VCSEL (до 0.55 км, MM)", "lam_nm": 850, "rate_mbps": 1250,
+     "reach_km": 0.55, "laser": "VCSEL", "p_tx_dbm": -7.0, "sens_dbm": -17.0, "overload_dbm": -3.0,
+     "clock_mhz": 25.0, "conn": "LC", "note": "багатомодове 50/125 — короткі котушки"},
+    {"name": "SFP 1.25G LX, 1310 нм (до 10 км)", "lam_nm": 1310, "rate_mbps": 1250,
+     "reach_km": 10, "laser": "FP", "p_tx_dbm": -6.0, "sens_dbm": -23.0, "overload_dbm": -3.0,
+     "clock_mhz": 25.0, "conn": "LC", "note": "одномодове 9/125"},
+    {"name": "SFP 1.25G, 1310 нм (до 20 км)", "lam_nm": 1310, "rate_mbps": 1250,
+     "reach_km": 20, "laser": "FP", "p_tx_dbm": -4.0, "sens_dbm": -26.0, "overload_dbm": -3.0,
+     "clock_mhz": 25.0, "conn": "LC", "note": "типовий для котушок 10–15 км"},
+    {"name": "SFP 1.25G, 1550 нм DFB (до 40–80 км)", "lam_nm": 1550, "rate_mbps": 1250,
+     "reach_km": 40, "laser": "DFB", "p_tx_dbm": 2.0, "sens_dbm": -30.0, "overload_dbm": -3.0,
+     "clock_mhz": 25.0, "conn": "LC", "note": "запас по дальності, чутливий до відбиттів"},
+    {"name": "BiDi WDM 1310/1550 (одноволоконний, до 20 км)", "lam_nm": 1310, "rate_mbps": 1250,
+     "reach_km": 20, "laser": "FP/DFB", "p_tx_dbm": -3.0, "sens_dbm": -26.0, "overload_dbm": -3.0,
+     "clock_mhz": 25.0, "conn": "SC (WDM)", "note": "один волокно-канал: відео + телеметрія — домінує в ОВ-FPV"},
+    {"name": "SFP+ 10G LR, 1310 нм (до 10 км)", "lam_nm": 1310, "rate_mbps": 10312,
+     "reach_km": 10, "laser": "DFB", "p_tx_dbm": -2.0, "sens_dbm": -15.0, "overload_dbm": -1.0,
+     "clock_mhz": 156.25, "conn": "LC", "note": "HD/4K відео без стиснення"},
+    {"name": "PON-клас 1490/1310 (2.5G вниз / 1.25G вгору)", "lam_nm": 1490, "rate_mbps": 2500,
+     "reach_km": 20, "laser": "DFB", "p_tx_dbm": 2.0, "sens_dbm": -27.0, "overload_dbm": -3.0,
+     "clock_mhz": 125.0, "conn": "SC/APC", "note": "штатна оптика GPON у ролі тракту"},
+    {"name": "Аналогове FM-відео по ВОЛЗ, 1310 нм", "lam_nm": 1310, "rate_mbps": 0,
+     "reach_km": 5, "laser": "FP", "p_tx_dbm": -10.0, "sens_dbm": -20.0, "overload_dbm": -5.0,
+     "clock_mhz": 0.0, "conn": "FC/ST", "note": "без CDR — вплив лише засліпленням"},
+]
+
+FIBER_CLOCKS = [
+    ("Кварц МК польотного контролера (F405/F722 HSE)", 8.0),
+    ("Кварц МК контролера (H7/G4 HSE)", 12.0),
+    ("Кварц GPS-модуля", 26.0),
+    ("Опорний генератор ОВ-модему 1.25G (CDR)", 25.0),
+    ("Опорний генератор ОВ-модему 10G (CDR)", 156.25),
+    ("Тактування відеосенсора (MCLK)", 24.0),
+    ("Кварц аналогового відеопередавача", 25.0),
+    ("ШІМ ESC (електромеханічний резонанс)", 0.024),
+]
+
+
+def fiber_bleach(p_inj_dbm, div_mrad, dist_m, core_um=9.0, ins_loss_db=2.0):
+    """Інжекція світла у волокно ОВ-тракту (v5.4.0): діаметр плями на торці
+    (мкм) = дистанція × розбіжність; втрати геометричного узгодження
+    20lg(пляма/серцевина), якщо пляма більша за серцевину 9 мкм.
+    Повертає dict(spot_um, geom_db, p_rx_dbm) — потужність на вході приймача."""
+    spot_um = max(0.0, float(dist_m) * float(div_mrad) * 1000.0)
+    if spot_um > float(core_um):
+        geom_db = 20.0 * math.log10(spot_um / float(core_um))
+    else:
+        geom_db = 0.0
+    p_rx = float(p_inj_dbm) - float(ins_loss_db) - geom_db
+    return {"spot_um": spot_um, "geom_db": geom_db, "p_rx_dbm": p_rx}
+
+
+def fiber_bleach_needed(dist_m, target_dbm, div_mrad, core_um=9.0, ins_loss_db=2.0):
+    """Потрібна потужність інжектора (дБм), щоб на вході приймача було target_dbm (v5.4.0)."""
+    spot_um = max(0.0, float(dist_m) * float(div_mrad) * 1000.0)
+    geom_db = 20.0 * math.log10(spot_um / float(core_um)) if spot_um > float(core_um) else 0.0
+    return float(target_dbm) + float(ins_loss_db) + geom_db
+
+
+def fiber_status(p_rx_dbm, sens_dbm, overload_dbm, margin_db=6.0):
+    """Стан приймача ОВ-модему під інжекцією (v5.4.0): (код, опис) —
+    2 = засліплення (>= перевантаження), 1 = зрив CDR/деградація (>= чутливість + запас),
+    0 = без впливу."""
+    p = float(p_rx_dbm)
+    if p >= float(overload_dbm):
+        return (2, "ЗАСЛІПЛЕННЯ — фотодіод у насиченні, тракту немає")
+    if p >= float(sens_dbm) + float(margin_db):
+        return (1, "ЗРив CDR / підміна потоку — інжекція домінує над сигналом")
+    if p >= float(sens_dbm):
+        return (1, "Біля чутливості — можливі поодинокі зриви")
+    return (0, "Без впливу (нижче чутливості)")
+
+
+def mcu_resonance(f_res_hz, dist_m, u_req_v=0.5, l_eff_m=0.1, g_ant_db=0.0):
+    """ЕМ-вплив на резонансній частоті контролера (v5.4.0): потрібна напруженість
+    поля E = U_req / l_eff; EIRP з E на дистанції d (E = sqrt(30·P)/d).
+    Повертає dict(e_req_vm, eirp_dbm)."""
+    e_req = float(u_req_v) / max(float(l_eff_m), 1e-3)
+    p_w = (e_req * float(dist_m)) ** 2 / 30.0
+    return {"e_req_vm": e_req,
+            "eirp_dbm": 10.0 * math.log10(max(p_w, 1e-12) * 1000.0) - float(g_ant_db)}
+
+
+def fiber_modems_csv(path):
+    """CSV-довідник класів ОВ-модемів (v5.4.0), роздільник ';' (Excel-сумісний)."""
+    import csv
+    with open(path, "w", encoding="utf-8-sig", newline="") as fh:
+        w = csv.writer(fh, delimiter=";")
+        w.writerow(["модем", "лямбда, нм", "швидкість, Мбіт/с", "дальність, км", "лазер",
+                    "P_перед, дБм", "чутливість, дБм", "перевантаження, дБм",
+                    "опорний генератор, МГц", "з'єднання", "примітка"])
+        for m in FIBER_MODEMS:
+            w.writerow([m["name"], m["lam_nm"], m["rate_mbps"], m["reach_km"], m["laser"],
+                        m["p_tx_dbm"], m["sens_dbm"], m["overload_dbm"], m["clock_mhz"],
+                        m["conn"], m["note"]])
+    return path
+
+
+def iq_top_peaks(freqs_hz, psd_db, fs_eff, n_peaks=8, min_db=12.0, min_gap_hz=None):
+    """Топ-N піків спектра для багатоцільової завади (v4.9.0).
+
+    Локальні максимуми вище шумової підлоги на min_db (дБ), розділені
+    щонайменше на min_gap_hz (дефолт 0.5% fs), сортовані за потужністю;
+    для кожного — зайнята смуга (-20 дБ від піка) і тип завади через
+    jam_from_peak. Повертає список dict(f_hz, width_hz, peak_db, kind,
+    kind_name, bw_mhz, dev_mhz, per_us)."""
+    n = int(np.asarray(psd_db).size)
+    if n < 8:
+        return []
+    if min_gap_hz is None:
+        min_gap_hz = max(float(fs_eff) * 0.005, 5e3)
+    floor = float(np.median(psd_db))
+    thr = floor + float(min_db)
+    cand = []
+    for i in range(1, n - 1):
+        v = float(psd_db[i])
+        if v >= thr and v > psd_db[i - 1] and v >= psd_db[i + 1]:
+            cand.append((v, i))
+    cand.sort(reverse=True)
+    mx = float(np.max(psd_db))
+    peaks = []
+    for v, i in cand:
+        fi = float(freqs_hz[i])
+        if any(abs(fi - p["f_hz"]) < min_gap_hz for p in peaks):
+            continue
+        thr20 = v - 20.0
+        j = i
+        while j > 0 and psd_db[j] > thr20:
+            j -= 1
+        k = i
+        while k < n - 1 and psd_db[k] > thr20:
+            k += 1
+        width = max(float(freqs_hz[k] - freqs_hz[j]), float(fs_eff) / float(n))
+        d = jam_from_peak(fi / 1e6, 0.0, width / 1e6)
+        peaks.append({"f_hz": fi, "width_hz": width, "peak_db": v - mx,
+                      "kind": d["kind"], "kind_name": d["kind_name"],
+                      "bw_mhz": d["bw_mhz"], "dev_mhz": d["dev_mhz"],
+                      "per_us": d["per_us"]})
+        if len(peaks) >= int(n_peaks):
+            break
+    return peaks
+
+
 def iq_jam_analyze(path, dtype="float32", fs_iq=0.0, fc=0.0,
                    js_target=15.0, nfft=8192, bw_thr_db=-20.0, db_off=0.0):
     """Аналіз IQ-запису → параметри якісної завади (v3.19.0).
@@ -2772,7 +3600,8 @@ def iq_jam_analyze(path, dtype="float32", fs_iq=0.0, fc=0.0,
             "bw_mhz": d["bw_mhz"], "dev_mhz": d["dev_mhz"], "per_us": d["per_us"],
             "note": "IQ: %d відл., %d вікон по %d (Welch, Ганн)"
                     % (x.size, segs.shape[0], nfft),
-            "freqs_hz": freqs_hz, "psd_db": psd_db}
+            "freqs_hz": freqs_hz, "psd_db": psd_db,
+            "peaks": iq_top_peaks(freqs_hz, psd_db, fs_eff)}
 
 
 def iq_to_raw(x, fc, fs_iq, fs_out=DEFAULT_FS, n_per_ch=16384, nch=8, seed=42, bw_hz=CHANNEL_BW):
@@ -3070,6 +3899,13 @@ def run_gui(path=None, fs=DEFAULT_FS, nch=DEFAULT_NCH):
             self.btn_help.pack(side="bottom", fill="x", padx=6, pady=(2, 0))
             ttk.Button(self, text="📊 Спектрограма .raw… — запуск і перегляд на екрані",
                        command=self._specgram_open).pack(side="bottom", fill="x", padx=6, pady=(2, 0))
+            arow = ttk.Frame(self); arow.pack(side="bottom", fill="x", padx=6, pady=(2, 0))
+            ttk.Button(arow, text="⛰ 3D-спектрограма…", command=self._specgram_open).pack(side="left", padx=2)
+            ttk.Button(arow, text="⚔ Завада vs ціль (3D)…", command=self._vs3d_open).pack(side="left", padx=2)
+            ttk.Button(arow, text="⚖ Порівняння A/B…", command=self._ab_open).pack(side="left", padx=2)
+            ttk.Button(arow, text="⏱ PRI-аналіз…", command=self._pri_open).pack(side="left", padx=2)
+            ttk.Button(arow, text="🔊 Демодуляція аудіо…", command=self._demod_open).pack(side="left", padx=2)
+            ttk.Button(arow, text="🗂 Батч-аналіз теки…", command=self._batch_open).pack(side="left", padx=2)
             self.txt_help = tk.Text(self, height=10, wrap="word", font=("DejaVu Sans", 9),
                                    state="normal")
             self.txt_help.insert("1.0", self.HELP_TEXT)
@@ -3924,7 +4760,7 @@ def run_gui(path=None, fs=DEFAULT_FS, nch=DEFAULT_NCH):
             from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
             w = tk.Toplevel(self)
             w.title("Завада з IQ — сигнал і спектр")
-            w.geometry("960x780")
+            w.geometry("960x900")
             w.configure(bg=THEME["panel"])
             self.iqj_win = w
             top = tk.Frame(w, bg=THEME["panel"])
@@ -3967,6 +4803,28 @@ def run_gui(path=None, fs=DEFAULT_FS, nch=DEFAULT_NCH):
                                                 "підлога, динаміка, рівень і параметри завади.",
                                         justify="left", anchor="w", bg=THEME["panel"], fg=THEME["text"])
             self.iqj_res_lbl.pack(side="top", fill="x", padx=10, pady=(2, 4))
+            row3 = tk.Frame(w, bg=THEME["panel"])
+            row3.pack(side="top", fill="x", padx=8, pady=(0, 2))
+            tk.Label(row3, text="Топ-N піків (вибрані рядки — для застосування):",
+                     bg=THEME["panel"], fg=THEME["text"]).pack(side="left")
+            ttk.Button(row3, text="Піки → канали плану", style="Accent.TButton",
+                       command=self._iqj_peaks_apply).pack(side="left", padx=10)
+            self.iqj_shape = tk.BooleanVar(value=False)
+            ttk.Checkbutton(row3, text="шум за профілем спектра",
+                            variable=self.iqj_shape).pack(side="left")
+            _iqj_cols = ("n", "f", "bw", "kind", "db")
+            _st99 = ttk.Style(w)
+            _st99.configure("Iqj.Treeview", background=THEME["panel2"],
+                            foreground=THEME["text"], fieldbackground=THEME["panel2"],
+                            rowheight=22)
+            self.iqj_tree = ttk.Treeview(w, columns=_iqj_cols, show="headings", height=6,
+                                         selectmode="extended", style="Iqj.Treeview")
+            for _c, _t, _wd in (("n", "№", 34), ("f", "Пік, МГц", 105),
+                                ("bw", "Смуга, кГц", 95), ("kind", "Тип завади", 165),
+                                ("db", "Рівень, дБ", 100)):
+                self.iqj_tree.heading(_c, text=_t)
+                self.iqj_tree.column(_c, width=_wd, anchor="w", stretch=True)
+            self.iqj_tree.pack(side="top", fill="x", padx=8, pady=(2, 4))
             self.iqj_status = tk.Label(w, text="", bg=THEME["panel"], fg=THEME["dim"], anchor="w")
             self.iqj_status.pack(side="bottom", fill="x")
             self.iqj_fig = Figure(figsize=(8.9, 4.9), dpi=100)
@@ -4003,12 +4861,25 @@ def run_gui(path=None, fs=DEFAULT_FS, nch=DEFAULT_NCH):
                 messagebox.showerror(APP_TITLE, "Завада з IQ: %s" % e)
                 return
             self.iqj_res = res
+            self.iqj_spec_path = p + ".spectrum.json"
+            try:
+                save_spectrum_profile(self.iqj_spec_path, res["freqs_hz"], res["psd_db"], fc_hz)
+            except Exception:
+                self.iqj_spec_path = ""
+            self.iqj_tree.delete(*self.iqj_tree.get_children())
+            for _i, _pk in enumerate(res.get("peaks", ())):
+                self.iqj_tree.insert("", "end", iid=str(_i), values=(
+                    _i + 1, "%.6f" % (_pk["f_hz"] / 1e6), "%.4g" % (_pk["width_hz"] / 1e3),
+                    _pk["kind_name"], "%.1f" % _pk["peak_db"]))
             self.iqj_ax.clear()
             self.iqj_ax.plot(res["freqs_hz"] / 1e6, res["psd_db"], lw=0.7)
             self.iqj_ax.axvline(res["f_peak_hz"] / 1e6, color="red", lw=1.2)
             self.iqj_ax.axvspan((res["f_peak_hz"] - res["width_hz"] / 2.0) / 1e6,
                                 (res["f_peak_hz"] + res["width_hz"] / 2.0) / 1e6,
                                 color="orange", alpha=0.25)
+            if res.get("peaks"):
+                self.iqj_ax.plot([pk["f_hz"] / 1e6 for pk in res["peaks"]],
+                                 [pk["peak_db"] for pk in res["peaks"]], "rv", ms=6)
             self.iqj_ax.set_xlabel("Частота, МГц")
             self.iqj_ax.set_ylabel("Рівень, дБ (відн. піка)")
             self.iqj_ax.set_title("Спектр IQ: %s — %s" % (os.path.basename(p), res["note"]))
@@ -4029,6 +4900,18 @@ def run_gui(path=None, fs=DEFAULT_FS, nch=DEFAULT_NCH):
             if not res:
                 messagebox.showinfo(APP_TITLE, "Спочатку проаналізуйте IQ («Аналізувати»).")
                 return
+            _prot = []
+            try:
+                _prot = parse_protected_mhz(self.ex_protect.get())
+            except (ValueError, AttributeError):
+                _prot = []
+            if (is_protected(res["f_hz"], _prot)
+                    or is_protected(res["f_hz"] - res["width_hz"] / 2.0, _prot)
+                    or is_protected(res["f_hz"] + res["width_hz"] / 2.0, _prot)):
+                messagebox.showwarning(APP_TITLE,
+                                       "Захищені частоти: пік %.6g МГц у захищеній смузі — застосування скасовано."
+                                       % (res["f_hz"] / 1e6))
+                return
             used = 0
             for en, kd, vals in self.gen_rows:
                 if bool(en.get()):
@@ -4044,6 +4927,78 @@ def run_gui(path=None, fs=DEFAULT_FS, nch=DEFAULT_NCH):
                              "(%.1f dBFS + офсет %.1f дБ), для J/S +%.0f дБ потрібно ≈ %.1f дБм"
                              % (res["kind_name"], res["f_hz"] / 1e6, used, res["sig_dbm"], res["dbfs"],
                                 res["db_off"], res["js"], res["jam_req_dbm"]))
+
+        def _iqj_peaks_apply(self):
+            res = getattr(self, "iqj_res", None)
+            if not res or not res.get("peaks"):
+                messagebox.showinfo(APP_TITLE, "Спочатку проаналізуйте IQ («Аналізувати»).")
+                return
+            peaks = res["peaks"]
+            sel = set(self.iqj_tree.selection())
+            idxs = sorted(int(i) for i in sel) if sel else list(range(len(peaks)))
+            use = [peaks[i] for i in idxs if i < len(peaks)]
+            if not use:
+                messagebox.showinfo(APP_TITLE, "Таблиця піків порожня.")
+                return
+            rows = [(i, en, kd, vals) for i, (en, kd, vals) in enumerate(self.gen_rows)
+                    if bool(en.get())]
+            if not rows:
+                messagebox.showinfo(APP_TITLE,
+                                    "Увімкніть хоча б один канал Генератора (⚙ ГЕНЕРАТОР СИГНАЛУ).")
+                return
+            _prot = []
+            try:
+                _prot = parse_protected_mhz(self.ex_protect.get())
+            except (ValueError, AttributeError):
+                _prot = []
+            _skipped = 0
+            if _prot:
+                _kept = []
+                for _pk in use:
+                    if (is_protected(_pk["f_hz"], _prot)
+                            or is_protected(_pk["f_hz"] - _pk["width_hz"] / 2.0, _prot)
+                            or is_protected(_pk["f_hz"] + _pk["width_hz"] / 2.0, _prot)):
+                        _skipped += 1
+                    else:
+                        _kept.append(_pk)
+                use = _kept
+            if not use:
+                messagebox.showinfo(APP_TITLE,
+                                    "Усі вибрані піки — у захищених смугах; нічого не застосовано.")
+                return
+            assign, free = {}, list(range(len(use)))
+            for ri, en, kd, vals in rows:
+                try:
+                    frow = parse_freq_hz(vals[0].get())
+                except ValueError:
+                    frow = -1.0
+                for p_i, pk in enumerate(use):
+                    if p_i in free and abs(pk["f_hz"] - frow) <= pk["width_hz"] / 2.0:
+                        assign[ri] = pk
+                        free.remove(p_i)
+                        break
+            for ri, en, kd, vals in rows:
+                if ri in assign or not free:
+                    continue
+                assign[ri] = use[free.pop(0)]
+            for ri, pk in assign.items():
+                en, kd, vals = self.gen_rows[ri]
+                kd.set(pk["kind_name"])
+                vals[0].set("%.12g" % (pk["f_hz"] / 1e6))
+            bw_max = max((pk["bw_mhz"] for pk in use if pk["kind"] == "jam_noise"), default=0.0)
+            if bw_max > 0:
+                self.ex_jam_bw.set("%.12g" % bw_max)
+            if getattr(self, "iqj_shape", None) is not None and self.iqj_shape.get():
+                self.ex_jam_shape.set(getattr(self, "iqj_spec_path", "") or "")
+            else:
+                self.ex_jam_shape.set("")
+            _msg = "Піки → канали: %d піків → %d канал(ів)%s: %s" % (
+                len(use), len(assign),
+                ("; пропущено захищених: %d" % _skipped) if _skipped else "",
+                ", ".join("ch%d←%.6g МГц" % (ri, pk["f_hz"] / 1e6)
+                          for ri, pk in sorted(assign.items())))
+            self._set_status(_msg)
+            self.iqj_status.config(text=_msg)
 
         def _iqj_offset_value(self):
             try:
@@ -4788,7 +5743,41 @@ def run_gui(path=None, fs=DEFAULT_FS, nch=DEFAULT_NCH):
                 self.gen_rows.append((en, kind, vals))
                 self.audio_rows.append(k)
             rgen = nch_here + 3
-            gg = ttk.Frame(g); gg.grid(row=rgen + 7, column=0, columnspan=9, sticky="w", pady=(10, 4))
+            tl = ttk.LabelFrame(g, text="Крок 4б · Сценарій (фази на шкалі часу) — тривалість фази, с і активні канали ch")
+            tl.grid(row=rgen + 7, column=0, columnspan=9, sticky="we", pady=(6, 2), padx=2)
+            tlr1 = ttk.Frame(tl); tlr1.pack(fill="x", pady=1)
+            ttk.Label(tlr1, text="тривалість фази, с:").pack(side="left")
+            self.tl_t = tk.StringVar(value="5")
+            ttk.Entry(tlr1, textvariable=self.tl_t, width=8).pack(side="left", padx=3)
+            ttk.Label(tlr1, text="канали ch (через кому):").pack(side="left", padx=(10, 0))
+            self.tl_ch = tk.StringVar(value="0,1")
+            ttk.Entry(tlr1, textvariable=self.tl_ch, width=10).pack(side="left", padx=3)
+            ttk.Label(tlr1, text="швидкість, м/с:").pack(side="left", padx=(10, 0))
+            self.tl_v = tk.StringVar(value="0")
+            ttk.Entry(tlr1, textvariable=self.tl_v, width=7).pack(side="left", padx=3)
+            ttk.Label(tlr1, text="дальність, км:").pack(side="left", padx=(10, 0))
+            self.tl_d = tk.StringVar(value="0")
+            ttk.Entry(tlr1, textvariable=self.tl_d, width=7).pack(side="left", padx=3)
+            ttk.Button(tlr1, text="+ Додати фазу", command=self._tl_add).pack(side="left", padx=(10, 3))
+            ttk.Button(tlr1, text="− Видалити останню", command=self._tl_del).pack(side="left", padx=3)
+            ttk.Button(tlr1, text="Очистити", command=self._tl_clear).pack(side="left", padx=3)
+            tlr2 = ttk.Frame(tl); tlr2.pack(fill="x", pady=1)
+            ttk.Button(tlr2, text="💾 Зберегти сценарій…", command=self._tl_save).pack(side="left", padx=3)
+            ttk.Button(tlr2, text="📂 Завантажити сценарій…", command=self._tl_load).pack(side="left", padx=3)
+            ttk.Button(tlr2, text="▶ Згенерувати сценарій .raw…", command=self._tl_generate,
+                       style="Accent.TButton").pack(side="left", padx=(3, 8))
+            ttk.Label(tlr2, text="готові сценарії:").pack(side="left", padx=(8, 0))
+            self.tl_preset = ttk.Combobox(tlr2, values=[p["name"] for p in SCENARIO_PRESETS],
+                                          width=28, state="readonly")
+            self.tl_preset.current(0)
+            self.tl_preset.pack(side="left", padx=3)
+            ttk.Button(tlr2, text="⤵ Застосувати", command=self._tl_preset_apply).pack(side="left", padx=3)
+            self.tl_list = tk.Text(tl, height=3, width=60, font=("DejaVu Sans Mono", 8))
+            self.tl_list.pack(fill="x", pady=(2, 0))
+            self.tl_cv = tk.Canvas(tl, height=34, highlightthickness=0)
+            self.tl_cv.pack(fill="x", pady=(2, 2))
+            self.tl_phases = []
+            gg = ttk.Frame(g); gg.grid(row=rgen + 8, column=0, columnspan=9, sticky="w", pady=(10, 4))
             ttk.Label(gg, text="Блок:").pack(side="left")
             self.cb_block = ttk.Combobox(gg, values=["%d: %.0f–%.0f МГц" % (b["idx"], b["f0"] / 1e6, b["f1"] / 1e6)
                                                      for b in self.blocks], width=16, state="readonly")
@@ -4812,7 +5801,7 @@ def run_gui(path=None, fs=DEFAULT_FS, nch=DEFAULT_NCH):
             self.gen_seed = tk.StringVar(value="42")
             ttk.Entry(gg, textvariable=self.gen_seed, width=7).pack(side="left", padx=3)
             garow = ttk.Frame(g)
-            garow.grid(row=rgen + 8, column=0, columnspan=9, sticky="w", pady=(2, 0))
+            garow.grid(row=rgen + 9, column=0, columnspan=9, sticky="w", pady=(2, 0))
             ttk.Button(garow, text="🌐 Завантажити трек…", command=self._fetch_url_audio).pack(side="left", padx=8)
             ttk.Button(garow, text="🎵 Аудіо (стерео)…", command=self._load_audio).pack(side="left", padx=8)
             ttk.Label(garow, text="Форма для всіх вибраних:").pack(side="left", padx=(18, 4))
@@ -4822,10 +5811,15 @@ def run_gui(path=None, fs=DEFAULT_FS, nch=DEFAULT_NCH):
             ttk.Button(garow, text="→ застосувати до вибраних", command=self._apply_shape_selected).pack(side="left", padx=6)
             ttk.Button(garow, text="🤖 ШІ-підбір завади…", command=self._ai_open).pack(side="left", padx=6)
             ttk.Button(garow, text="🖼 Спектр із зображення…", command=self._specimg_open).pack(side="left", padx=6)
+            ttk.Button(garow, text="🧵 ОВ-дрон (оптика + контролер)…", command=self._fiber_open).pack(side="left", padx=6)
             prow = ttk.Frame(g)
-            prow.grid(row=rgen + 9, column=0, columnspan=10, sticky="w", pady=(2, 0))
+            prow.grid(row=rgen + 10, column=0, columnspan=10, sticky="w", pady=(2, 0))
+            ttk.Button(prow, text="📏 Метрика покриття", command=self._metric_open).pack(side="left", padx=(14, 3))
+            ttk.Button(prow, text="📄 Звіт у PDF…", command=self._pdf_open).pack(side="left", padx=3)
             ttk.Button(prow, text="💾 Зберегти пресет…", command=self._save_preset).pack(side="left", padx=8)
             ttk.Button(prow, text="📂 Завантажити пресет…", command=self._load_preset).pack(side="left", padx=8)
+            ttk.Button(prow, text="💾 Профіль сесії…", command=self._prof_save).pack(side="left", padx=8)
+            ttk.Button(prow, text="📂 Профіль сесії…", command=self._prof_load).pack(side="left", padx=8)
             ttk.Label(prow, text="«⚙» у рядку — власні АМ/ЧМ/імпульсні параметри каналу (⚙* = задано)",
                       foreground=THEME["dim"]).pack(side="left", padx=(14, 0))
             ttk.Button(gg, text="Крок 5 · Створити .raw…", command=self.generate, style="Accent.TButton").pack(side="left", padx=12)
@@ -4902,6 +5896,24 @@ def run_gui(path=None, fs=DEFAULT_FS, nch=DEFAULT_NCH):
             self.jq_vswr_scale_off = tk.BooleanVar(value=False)
             ttk.Checkbutton(jqc3, text="приховати шкалу КСВ", variable=self.jq_vswr_scale_off,
                             command=self._spec_redraw_safe).pack(side="left", padx=(14, 0))
+            jqc4 = ttk.Frame(jq); jqc4.pack(fill="x", pady=1)
+            ttk.Label(jqc4, text="Мапа покриття - поріг приймача, дБм:").pack(side="left")
+            self.jq_thr = tk.StringVar(value="-85")
+            ttk.Entry(jqc4, textvariable=self.jq_thr, width=6).pack(side="left", padx=3)
+            ttk.Button(jqc4, text="🗺 Мапа покриття (FSPL) - дальність за EIRP",
+                       command=self._map_open).pack(side="left", padx=(10, 0))
+            ttk.Button(jqc4, text="⛰ 3D-мапа покриття",
+                       command=self._map3d_open).pack(side="left", padx=(8, 0))
+            jqc5 = ttk.Frame(jq); jqc5.pack(fill="x", pady=1)
+            ttk.Label(jqc5, text="Оптимізатор потужності - J/S, дБ:").pack(side="left")
+            self.jq_js = tk.StringVar(value="15")
+            ttk.Entry(jqc5, textvariable=self.jq_js, width=5).pack(side="left", padx=3)
+            ttk.Label(jqc5, text="дальність, км:").pack(side="left", padx=(8, 0))
+            self.jq_optd = tk.StringVar(value="5")
+            ttk.Entry(jqc5, textvariable=self.jq_optd, width=5).pack(side="left", padx=3)
+            ttk.Button(jqc5, text="🎯 Мінімальна потужність ПП", command=self._power_opt_open).pack(side="left", padx=(10, 0))
+            self.lbl_popt = ttk.Label(jqc5, text="", foreground=THEME["accent"])
+            self.lbl_popt.pack(side="left", padx=(10, 0))
             self.jamq_frame = ttk.Frame(jq); self.jamq_frame.pack(fill="both", expand=True)
             self.jamq_rows = []
             self._jamq_table()
@@ -4939,6 +5951,7 @@ def run_gui(path=None, fs=DEFAULT_FS, nch=DEFAULT_NCH):
             ttk.Entry(gxr3, textvariable=self.ex_chirp_per, width=9).pack(side="left", padx=3)
             ttk.Label(gxr3, text="ширина смуги завади, МГц (шум):").pack(side="left", padx=(14, 0))
             self.ex_jam_bw = tk.StringVar(value="0")
+            self.ex_jam_shape = tk.StringVar(value="")
             ttk.Entry(gxr3, textvariable=self.ex_jam_bw, width=9).pack(side="left", padx=3)
             ttk.Label(gxr3, text="модуляція Mesh (QAM):").pack(side="left", padx=(14, 0))
             self.ex_qam = tk.StringVar(value="Адаптивна (BPSK…1024QAM)")
@@ -4951,6 +5964,26 @@ def run_gui(path=None, fs=DEFAULT_FS, nch=DEFAULT_NCH):
             ttk.Label(gxr4, text="дрейф зміщення (плаваюча несуча), Гц/с:").pack(side="left", padx=(14, 0))
             self.ex_sp_drift = tk.StringVar(value="0")
             ttk.Entry(gxr4, textvariable=self.ex_sp_drift, width=10).pack(side="left", padx=3)
+            gxr5 = ttk.Frame(gx); gxr5.pack(fill="x", pady=1)
+            ttk.Label(gxr5, text="RGPO: швидкість відриву, м/с (0 = 300):").pack(side="left")
+            self.ex_rgpo_v = tk.StringVar(value="0")
+            ttk.Entry(gxr5, textvariable=self.ex_rgpo_v, width=8).pack(side="left", padx=3)
+            ttk.Label(gxr5, text="макс. затримка, мкс (0 = 1000):").pack(side="left", padx=(10, 0))
+            self.ex_rgpo_d = tk.StringVar(value="0")
+            ttk.Entry(gxr5, textvariable=self.ex_rgpo_d, width=8).pack(side="left", padx=3)
+            ttk.Label(gxr5, text="VGPO: макс. доплер, кГц (0 = 30):").pack(side="left", padx=(10, 0))
+            self.ex_vgpo_f = tk.StringVar(value="0")
+            ttk.Entry(gxr5, textvariable=self.ex_vgpo_f, width=8).pack(side="left", padx=3)
+            ttk.Label(gxr5, text="час затягування, с (0 = 2):").pack(side="left", padx=(10, 0))
+            self.ex_vgpo_t = tk.StringVar(value="0")
+            ttk.Entry(gxr5, textvariable=self.ex_vgpo_t, width=8).pack(side="left", padx=3)
+            gxr6 = ttk.Frame(gx); gxr6.pack(fill="x", pady=1)
+            ttk.Label(gxr6, text="захищені частоти, МГц (кома; а-б = діапазон):").pack(side="left")
+            self.ex_protect = tk.StringVar(value="")
+            ttk.Entry(gxr6, textvariable=self.ex_protect, width=40).pack(side="left", padx=3)
+            ttk.Label(gxr6, text="рівень сигналу, дБ (J/S = 20lg(ампл) - рівень):").pack(side="left", padx=(14, 0))
+            self.ex_siglvl = tk.StringVar(value="0")
+            ttk.Entry(gxr6, textvariable=self.ex_siglvl, width=7).pack(side="left", padx=3)
 
             ach = ttk.LabelFrame(g, text="Крок 4 · АЧХ (опційно) — амплітуда залежно від частоти")
             ach.grid(row=rgen + 6, column=0, columnspan=9, sticky="we", pady=(8, 2), padx=2)
@@ -5700,6 +6733,18 @@ def run_gui(path=None, fs=DEFAULT_FS, nch=DEFAULT_NCH):
             d = self._ai_decide()
             if not d:
                 return
+            _prot = []
+            try:
+                _prot = parse_protected_mhz(self.ex_protect.get())
+            except (ValueError, AttributeError):
+                _prot = []
+            if (is_protected(d["f_hz"], _prot)
+                    or is_protected(d["f_hz"] - d["bw"] / 2.0, _prot)
+                    or is_protected(d["f_hz"] + d["bw"] / 2.0, _prot)):
+                messagebox.showwarning(APP_TITLE,
+                                       "Захищені частоти: %.6g МГц у захищеній смузі — застосування скасовано."
+                                       % (d["f_hz"] / 1e6))
+                return
             used = []
             for i, (en, kd, vals) in enumerate(self.gen_rows):
                 if bool(en.get()):
@@ -6081,6 +7126,856 @@ def run_gui(path=None, fs=DEFAULT_FS, nch=DEFAULT_NCH):
                 messagebox.showerror(APP_TITLE, "Не вдалося прочитати аудіо: %s" % e)
 
         # -- Спектрограма з .raw: діалог запуску і перегляду (v3.17.0) --
+        # ---------- v5.2.0: нові діалоги і методи ----------
+
+        # ---------- v5.4.0: модуль ОВ-дрону ----------
+
+        def _fiber_open(self):
+            win, top, _lbl = self._win("Завада дрону з ОВ-трактом керування", 1100, 700)
+
+            def _ent(row, var, wd=6):
+                tk.Entry(row, textvariable=var, width=wd, bg=THEME["panel2"], fg=THEME["text"],
+                         insertbackground=THEME["text"], relief="flat").pack(side="left", padx=2)
+            row0 = tk.Frame(win, bg=THEME["panel"])
+            row0.pack(side="top", fill="x", padx=8, pady=(0, 2))
+            _lbl(row0, "Модем ОВ-тракту:")
+            self.fm_combo = ttk.Combobox(row0, values=[m["name"] for m in FIBER_MODEMS],
+                                         width=46, state="readonly")
+            self.fm_combo.current(5)
+            self.fm_combo.pack(side="left", padx=3)
+            ttk.Button(row0, text="Обрати", command=self._fiber_pick).pack(side="left", padx=3)
+            self.fm_info = tk.Label(win, text="", bg=THEME["panel"], fg=THEME["text"],
+                                    anchor="w", justify="left", font=("DejaVu Sans Mono", 8),
+                                    wraplength=980)
+            self.fm_info.pack(side="top", fill="x", padx=10, pady=(2, 4))
+            fb = ttk.LabelFrame(win, text="Вплив на модем — інжекція світла у волокно (засліплення фотоприймача / зрив CDR)")
+            fb.pack(side="top", fill="x", padx=8, pady=4)
+            fbr = tk.Frame(fb, bg=THEME["panel"])
+            fbr.pack(side="top", fill="x", padx=6, pady=2)
+            _lbl(fbr, "P інжектора, дБм:")
+            self.fbp = tk.StringVar(value="10")
+            _ent(fbr, self.fbp)
+            _lbl(fbr, "розбіжність, мрад:")
+            self.fbd = tk.StringVar(value="10")
+            _ent(fbr, self.fbd)
+            _lbl(fbr, "дистанція до торця, м:")
+            self.fbdist = tk.StringVar(value="1.0")
+            _ent(fbr, self.fbdist)
+            _lbl(fbr, "втрати з'єднання, дБ:")
+            self.fbi = tk.StringVar(value="2.0")
+            _ent(fbr, self.fbi)
+            ttk.Button(fbr, text="⚡ Розрахувати", style="Accent.TButton",
+                       command=self._fiber_bleach_calc).pack(side="left", padx=(10, 2))
+            self.fm_bleach_lbl = tk.Label(win, text="", bg=THEME["panel"], fg=THEME["accent"],
+                                          anchor="w", justify="left", wraplength=980)
+            self.fm_bleach_lbl.pack(side="top", fill="x", padx=10)
+            fr_ = ttk.LabelFrame(win, text="Вплив на контролер — ЕМ-вплив на резонансній частоті (кварц МК / опорний генератор CDR)")
+            fr_.pack(side="top", fill="x", padx=8, pady=4)
+            frr = tk.Frame(fr_, bg=THEME["panel"])
+            frr.pack(side="top", fill="x", padx=6, pady=2)
+            _lbl(frr, "типові вузли:")
+            self.frc = ttk.Combobox(frr, values=[n for n, _ in FIBER_CLOCKS], width=40, state="readonly")
+            self.frc.current(3)
+            self.frc.pack(side="left", padx=2)
+            self.frc.bind("<<ComboboxSelected>>",
+                          lambda e: self.frf.set("%.6g" % dict(FIBER_CLOCKS)[self.frc.get()]))
+            frr2 = tk.Frame(fr_, bg=THEME["panel"])
+            frr2.pack(side="top", fill="x", padx=6, pady=2)
+            _lbl(frr2, "частота, МГц:")
+            self.frf = tk.StringVar(value="25")
+            _ent(frr2, self.frf, 8)
+            _lbl(frr2, "дистанція, м:")
+            self.frd = tk.StringVar(value="1.0")
+            _ent(frr2, self.frd)
+            _lbl(frr2, "потрібна U, В:")
+            self.fru = tk.StringVar(value="0.5")
+            _ent(frr2, self.fru)
+            _lbl(frr2, "ефект. довжина, м:")
+            self.frl = tk.StringVar(value="0.1")
+            _ent(frr2, self.frl)
+            _lbl(frr2, "G антени, дБ:")
+            self.frg = tk.StringVar(value="0")
+            _ent(frr2, self.frg)
+            ttk.Button(frr2, text="🎯 Розрахувати", style="Accent.TButton",
+                       command=self._fiber_res_calc).pack(side="left", padx=(10, 2))
+            self.fm_res_lbl = tk.Label(win, text="", bg=THEME["panel"], fg=THEME["accent"],
+                                       anchor="w", justify="left", wraplength=980)
+            self.fm_res_lbl.pack(side="top", fill="x", padx=10, pady=(2, 2))
+            row9 = tk.Frame(win, bg=THEME["panel"])
+            row9.pack(side="bottom", fill="x", padx=8, pady=4)
+            ttk.Button(row9, text="→ ПП, дБм у Крок 2в", command=self._fiber_apply).pack(side="left", padx=2)
+            ttk.Button(row9, text="💾 CSV довідника ОВ-модемів…",
+                       command=self._fiber_csv_save).pack(side="left", padx=8)
+            tk.Label(row9, text="значення довідника — типові орієнтири для планування РЕБ; "
+                                "для конкретного виробу потрібні вимірювання",
+                     bg=THEME["panel"], fg=THEME["dim"], wraplength=520, justify="left").pack(side="left", padx=(10, 0))
+            self.fm_bleach = None
+            self.fm_res = None
+            self._fiber_pick()
+
+        def _fiber_pick(self):
+            nm = self.fm_combo.get()
+            for m in FIBER_MODEMS:
+                if m["name"] == nm:
+                    self.fm_cur = dict(m)
+                    self.fm_info.config(text="λ %s нм · %s Мбіт/с · до %s км · лазер %s · "
+                                             "P_перед %s дБм · чутливість %s дБм · перевантаження %s дБм · "
+                                             "опорний генератор %s МГц · %s · %s"
+                                        % (m["lam_nm"], m["rate_mbps"], m["reach_km"], m["laser"],
+                                           m["p_tx_dbm"], m["sens_dbm"], m["overload_dbm"],
+                                           m["clock_mhz"], m["conn"], m["note"]))
+                    return
+            self.fm_info.config(text="модем не знайдено")
+
+        def _fiber_bleach_calc(self):
+            try:
+                p = float(self.fbp.get())
+                div = float(self.fbd.get())
+                d = float(self.fbdist.get())
+                ins = float(self.fbi.get())
+            except ValueError as e:
+                messagebox.showerror(APP_TITLE, "ОВ-модуль (засліплення): %s" % e)
+                return
+            m = getattr(self, "fm_cur", None) or FIBER_MODEMS[5]
+            r = fiber_bleach(p, div, d, ins_loss_db=ins)
+            code, txt = fiber_status(r["p_rx_dbm"], m["sens_dbm"], m["overload_dbm"])
+            need = fiber_bleach_needed(d, m["overload_dbm"], div, ins_loss_db=ins)
+            self.fm_bleach = dict(r)
+            self.fm_bleach["need"] = need
+            self.fm_bleach["code"] = code
+            self.fm_bleach_lbl.config(text="пляма %.0f мкм · геом. втрати %.1f дБ · P на фотодіоді %.1f дБм → %s · "
+                                           "для засліплення потрібно %.1f дБм на вході інжектора"
+                                      % (r["spot_um"], r["geom_db"], r["p_rx_dbm"], txt, need))
+            self._set_status("ОВ-модуль: P_rx %.1f дБм (%s)" % (r["p_rx_dbm"], txt))
+
+        def _fiber_res_calc(self):
+            try:
+                f = parse_freq_hz(self.frf.get())
+                d = float(self.frd.get())
+                u = float(self.fru.get())
+                le = float(self.frl.get())
+                g = float(self.frg.get())
+            except ValueError as e:
+                messagebox.showerror(APP_TITLE, "ОВ-модуль (резонанс): %s" % e)
+                return
+            r = mcu_resonance(f, d, u_req_v=u, l_eff_m=le, g_ant_db=g)
+            self.fm_res = dict(r)
+            self.fm_res["f_hz"] = float(f)
+            note = "" if f >= 1e6 else " (f < 1 МГц — ближня зона, оцінка орієнтовна)"
+            self.fm_res_lbl.config(text="f %.6g МГц: потрібно E %.1f В/м → EIRP %.1f дБм на %.3g м%s"
+                                   % (f / 1e6, r["e_req_vm"], r["eirp_dbm"], d, note))
+            self._set_status("ОВ-модуль: резонанс %.6g МГц → EIRP %.1f дБм" % (f / 1e6, r["eirp_dbm"]))
+
+        def _fiber_apply(self):
+            if not getattr(self, "fm_res", None):
+                messagebox.showinfo(APP_TITLE, "Спочатку розрахуйте резонанс.")
+                return
+            self.jq_pa.set("%.1f" % self.fm_res["eirp_dbm"])
+            self._set_status("ПП → %.1f дБм (резонанс %.6g МГц, ОВ-модуль)"
+                             % (self.fm_res["eirp_dbm"], self.fm_res["f_hz"] / 1e6))
+
+        def _fiber_csv_save(self):
+            out = filedialog.asksaveasfilename(defaultextension=".csv",
+                                               initialfile="fiber_modems.csv",
+                                               title="Куди зберегти довідник ОВ-модемів",
+                                               filetypes=[("CSV", "*.csv")])
+            if not out:
+                return
+            try:
+                fiber_modems_csv(out)
+            except OSError as e:
+                messagebox.showerror(APP_TITLE, "Не вдалося зберегти довідник: %s" % e)
+                return
+            self._set_status("довідник ОВ-модемів: %s (%d класів)"
+                             % (os.path.basename(out), len(FIBER_MODEMS)))
+
+        def _win(self, title, w=900, h=620):
+            win = tk.Toplevel(self)
+            win.title("%s — RAW Studio v%s" % (title, APP_VERSION))
+            win.geometry("%dx%d" % (w, h))
+            top = tk.Frame(win, bg=THEME["panel"])
+            top.pack(side="top", fill="x", padx=8, pady=6)
+
+            def _lbl(row, txt):
+                tk.Label(row, text=txt, bg=THEME["panel"],
+                         fg=THEME["text"]).pack(side="left", padx=(10, 2))
+            return win, top, _lbl
+
+        def _pick_into(self, var, title="Оберіть файл .raw"):
+            p = filedialog.askopenfilename(title=title,
+                                           filetypes=[("RAW записи", "*.raw"), ("Усі файли", "*.*")])
+            if p:
+                var.set(p)
+
+        def _specgram_3d(self):
+            try:
+                fs_hz = parse_freq_hz(self.spg_fs.get())
+                nch = int(self.spg_nch.get())
+                ch = int(self.spg_ch.get())
+                nfft = int(self.spg_nfft.get())
+                ov = float(self.spg_ov.get()) / 100.0
+            except ValueError as e:
+                messagebox.showerror(APP_TITLE, "3D-спектрограма: %s" % e)
+                return
+            p = self.spg_path.get().strip()
+            if not p or not os.path.exists(p):
+                messagebox.showerror(APP_TITLE, "Файл .raw не знайдено: %s" % (p or "—"))
+                return
+            try:
+                fr, tm, db, note = raw_spectrogram(p, fs_hz, nch=nch, ch=ch, nfft=nfft, overlap=ov)
+            except Exception as e:
+                messagebox.showerror(APP_TITLE, "3D-спектрограма: %s" % e)
+                return
+            self.spg_fig.clf()
+            ax = self.spg_fig.add_subplot(111, projection="3d")
+            Tm, Fm = np.meshgrid(tm, fr / 1e6)
+            ax.plot_surface(Tm, Fm, db, cmap="viridis",
+                            rstride=max(1, db.shape[0] // 120),
+                            cstride=max(1, db.shape[1] // 120),
+                            linewidth=0, antialiased=True)
+            ax.set_xlabel("Час, мс")
+            ax.set_ylabel("Частота, МГц")
+            ax.set_zlabel("дБ")
+            ax.set_title("3D-спектрограма: %s — канал %d, %s" % (os.path.basename(p), ch, note))
+            self.spg_fig.tight_layout()
+            self.spg_canvas.draw()
+            self.spg_ax = ax
+            self.spg_ready3d = True
+            self._set_status("3D-спектрограма: %s — %d×%d комірок" % (os.path.basename(p), db.shape[0], db.shape[1]))
+
+        def _vs3d_open(self):
+            win, top, _lbl = self._win("Завада vs ціль (3D)")
+            self.vs_path = tk.StringVar(value=getattr(self, "last_raw_path", ""))
+            _lbl(top, "Файл цілі .raw:")
+            tk.Entry(top, textvariable=self.vs_path, width=30, bg=THEME["panel2"], fg=THEME["text"],
+                     insertbackground=THEME["text"], relief="flat").pack(side="left", padx=2)
+            ttk.Button(top, text="Огляд…", command=lambda: self._pick_into(self.vs_path)).pack(side="left", padx=2)
+            row2 = tk.Frame(win, bg=THEME["panel"])
+            row2.pack(side="top", fill="x", padx=8, pady=(0, 4))
+            _lbl(row2, "fs, МГц:")
+            self.vs_fs = tk.StringVar(value=self.gen_fs.get())
+            tk.Entry(row2, textvariable=self.vs_fs, width=8, bg=THEME["panel2"], fg=THEME["text"],
+                     insertbackground=THEME["text"], relief="flat").pack(side="left", padx=2)
+            _lbl(row2, "Каналів:")
+            self.vs_nch = tk.StringVar(value=self.nch_var.get())
+            tk.Entry(row2, textvariable=self.vs_nch, width=4, bg=THEME["panel2"], fg=THEME["text"],
+                     insertbackground=THEME["text"], relief="flat").pack(side="left", padx=2)
+            _lbl(row2, "Канал №:")
+            self.vs_ch = tk.StringVar(value="0")
+            tk.Entry(row2, textvariable=self.vs_ch, width=4, bg=THEME["panel2"], fg=THEME["text"],
+                     insertbackground=THEME["text"], relief="flat").pack(side="left", padx=2)
+            _lbl(row2, "завада — центр, МГц:")
+            self.vs_jf = tk.StringVar(value="2400")
+            tk.Entry(row2, textvariable=self.vs_jf, width=8, bg=THEME["panel2"], fg=THEME["text"],
+                     insertbackground=THEME["text"], relief="flat").pack(side="left", padx=2)
+            _lbl(row2, "смуга, МГц:")
+            self.vs_jbw = tk.StringVar(value="20")
+            tk.Entry(row2, textvariable=self.vs_jbw, width=6, bg=THEME["panel2"], fg=THEME["text"],
+                     insertbackground=THEME["text"], relief="flat").pack(side="left", padx=2)
+            _lbl(row2, "J/S, дБ:")
+            self.vs_js = tk.StringVar(value="15")
+            tk.Entry(row2, textvariable=self.vs_js, width=5, bg=THEME["panel2"], fg=THEME["text"],
+                     insertbackground=THEME["text"], relief="flat").pack(side="left", padx=2)
+            ttk.Button(row2, text="⚔ Порівняти", style="Accent.TButton",
+                       command=self._vs3d_run).pack(side="left", padx=(12, 2))
+            self.vs_status = tk.Label(win, text="Оберіть запис цілі і параметри завади.",
+                                      bg=THEME["panel"], fg=THEME["dim"], anchor="w")
+            self.vs_status.pack(side="bottom", fill="x")
+            self.vs_fig = Figure(figsize=(8.6, 5.0), dpi=100)
+            self.vs_ax = self.vs_fig.add_subplot(111, projection="3d")
+            self.vs_ax.set_title("Завада vs ціль — дані не обрано")
+            self.vs_canvas = FigureCanvasTkAgg(self.vs_fig, master=win)
+            self.vs_canvas.get_tk_widget().pack(side="top", fill="both", expand=True)
+            self.vs_canvas.draw()
+            self.vs_result = None
+
+        def _vs3d_run(self):
+            try:
+                fs_hz = parse_freq_hz(self.vs_fs.get())
+                nch = int(self.vs_nch.get())
+                ch = int(self.vs_ch.get())
+                jf = parse_freq_hz(self.vs_jf.get())
+                jbw = parse_freq_hz(self.vs_jbw.get())
+                js = float(self.vs_js.get())
+            except ValueError as e:
+                messagebox.showerror(APP_TITLE, "Завада vs ціль: %s" % e)
+                return
+            p = self.vs_path.get().strip()
+            if not p or not os.path.exists(p):
+                messagebox.showerror(APP_TITLE, "Файл .raw не знайдено: %s" % (p or "—"))
+                return
+            try:
+                fr, psd = _psd_mean(_chan_column(p, nch, ch, max_samples=1 << 21), fs_hz, 4096)
+            except Exception as e:
+                messagebox.showerror(APP_TITLE, "Завада vs ціль: %s" % e)
+                return
+            i = int(np.argmax(psd))
+            thr = psd[i] - 20.0
+            j = i
+            while j > 0 and psd[j] > thr:
+                j -= 1
+            k = i
+            while k < psd.size - 1 and psd[k] > thr:
+                k += 1
+            ov = jam_overlap(float(fr[j]), float(fr[k]), jf, jbw)
+            ov["js_db"] = js
+            ov["band"] = (float(fr[j]), float(fr[k]))
+            ov["jf"] = float(jf)
+            ov["jbw"] = float(jbw)
+            ov["raw_path"] = p
+            ov["fs_hz"] = float(fs_hz)
+            ov["nch"] = int(nch)
+            ov["ch"] = int(ch)
+            self.vs_result = ov
+            tgt = psd - psd.max()
+            jm = np.where((fr >= jf - jbw / 2.0) & (fr <= jf + jbw / 2.0), js, -80.0)
+            self.vs_fig.clf()
+            ax = self.vs_fig.add_subplot(111, projection="3d")
+            Ff, Yy = np.meshgrid(fr / 1e6, np.array([0.0, 1.0]))
+            ax.plot_surface(Ff, Yy, np.tile(tgt, (2, 1)), color="#3a7bd5", alpha=0.9, linewidth=0)
+            Ff2, Yy2 = np.meshgrid(fr / 1e6, np.array([2.2, 3.2]))
+            ax.plot_surface(Ff2, Yy2, np.tile(jm, (2, 1)), color="#d9534f", alpha=0.75, linewidth=0)
+            if ov["f_lo"] is not None:
+                Fo, Yo = np.meshgrid(np.array([ov["f_lo"] / 1e6, ov["f_hi"] / 1e6]),
+                                     np.array([1.0, 2.2]))
+                Zo = np.array([[float(tgt.min()), float(tgt.min())], [js, js]])
+                ax.plot_surface(Fo, Yo, Zo, color="#f0ad4e", alpha=0.35, linewidth=0)
+            ax.set_xlabel("Частота, МГц")
+            ax.set_ylabel("ціль / завада")
+            ax.set_zlabel("дБ відн. піка цілі")
+            ax.set_title("Ціль: %.3f МГц (смуга %.3f МГц) — перекриття %.0f%%, J/S %+.0f дБ"
+                         % (fr[i] / 1e6, (fr[k] - fr[j]) / 1e6, ov["pct"], js))
+            self.vs_fig.tight_layout()
+            self.vs_canvas.draw()
+            self.vs_status.config(text="ціль: f %.3f МГц (смуга %.3f МГц) · завада %.3f МГц ±%.1f МГц · перекриття %.0f%% · J/S %+.0f дБ"
+                                  % (fr[i] / 1e6, (fr[k] - fr[j]) / 1e6, jf / 1e6, jbw / 2e6, ov["pct"], js))
+            self._set_status("Завада vs ціль: перекриття %.0f%% (J/S %+.0f дБ)" % (ov["pct"], js))
+
+        def _ab_open(self):
+            win, top, _lbl = self._win("Порівняння записів A/B")
+            self.ab_a = tk.StringVar(value=getattr(self, "last_raw_path", ""))
+            self.ab_b = tk.StringVar(value="")
+            _lbl(top, "Запис A (.raw):")
+            tk.Entry(top, textvariable=self.ab_a, width=26, bg=THEME["panel2"], fg=THEME["text"],
+                     insertbackground=THEME["text"], relief="flat").pack(side="left", padx=2)
+            ttk.Button(top, text="Огляд…", command=lambda: self._pick_into(self.ab_a, "Запис A")).pack(side="left", padx=2)
+            _lbl(top, "Запис B (.raw):")
+            tk.Entry(top, textvariable=self.ab_b, width=26, bg=THEME["panel2"], fg=THEME["text"],
+                     insertbackground=THEME["text"], relief="flat").pack(side="left", padx=2)
+            ttk.Button(top, text="Огляд…", command=lambda: self._pick_into(self.ab_b, "Запис B")).pack(side="left", padx=2)
+            row2 = tk.Frame(win, bg=THEME["panel"])
+            row2.pack(side="top", fill="x", padx=8, pady=(0, 4))
+            _lbl(row2, "fs, МГц:")
+            self.ab_fs = tk.StringVar(value=self.gen_fs.get())
+            tk.Entry(row2, textvariable=self.ab_fs, width=8, bg=THEME["panel2"], fg=THEME["text"],
+                     insertbackground=THEME["text"], relief="flat").pack(side="left", padx=2)
+            _lbl(row2, "Каналів:")
+            self.ab_nch = tk.StringVar(value=self.nch_var.get())
+            tk.Entry(row2, textvariable=self.ab_nch, width=4, bg=THEME["panel2"], fg=THEME["text"],
+                     insertbackground=THEME["text"], relief="flat").pack(side="left", padx=2)
+            _lbl(row2, "Канал №:")
+            self.ab_ch = tk.StringVar(value="0")
+            tk.Entry(row2, textvariable=self.ab_ch, width=4, bg=THEME["panel2"], fg=THEME["text"],
+                     insertbackground=THEME["text"], relief="flat").pack(side="left", padx=2)
+            ttk.Button(row2, text="⚖ Порівняти", style="Accent.TButton",
+                       command=self._ab_run).pack(side="left", padx=(12, 2))
+            self.ab_status = tk.Label(win, text="A — до увімкнення завади, B — після: дельта у смузі піка A.",
+                                      bg=THEME["panel"], fg=THEME["dim"], anchor="w")
+            self.ab_status.pack(side="bottom", fill="x")
+            self.ab_fig = Figure(figsize=(8.6, 5.0), dpi=100)
+            self.ab_ax = self.ab_fig.add_subplot(111)
+            self.ab_ax.set_title("A/B — дані не обрано")
+            self.ab_canvas = FigureCanvasTkAgg(self.ab_fig, master=win)
+            self.ab_canvas.get_tk_widget().pack(side="top", fill="both", expand=True)
+            self.ab_canvas.draw()
+            self.ab_result = None
+
+        def _ab_run(self):
+            try:
+                fs_hz = parse_freq_hz(self.ab_fs.get())
+                nch = int(self.ab_nch.get())
+                ch = int(self.ab_ch.get())
+            except ValueError as e:
+                messagebox.showerror(APP_TITLE, "Порівняння A/B: %s" % e)
+                return
+            pa_, pb_ = self.ab_a.get().strip(), self.ab_b.get().strip()
+            for q, nm in ((pa_, "A"), (pb_, "B")):
+                if not q or not os.path.exists(q):
+                    messagebox.showerror(APP_TITLE, "Файл %s не знайдено: %s" % (nm, q or "—"))
+                    return
+            try:
+                r = ab_compare(pa_, pb_, fs_hz, nch=nch, ch=ch)
+            except Exception as e:
+                messagebox.showerror(APP_TITLE, "Порівняння A/B: %s" % e)
+                return
+            self.ab_result = r
+            self.ab_fig.clf()
+            ax = self.ab_fig.add_subplot(111)
+            fmhz = r["freqs"] / 1e6
+            ax.plot(fmhz, r["psd_a"], lw=1, color="#3a7bd5", label="A (до)")
+            ax.plot(fmhz, r["psd_b"], lw=1, color="#d9534f", label="B (після)")
+            ax.set_xlabel("Частота, МГц")
+            ax.set_ylabel("Рівень, дБ")
+            ax.legend(loc="upper right")
+            ax.set_title("A/B: пік A %.3f МГц — придушення %.1f дБ (виразність %.1f → %.1f дБ)"
+                         % (r["f_hz"] / 1e6, r["suppress_db"], r["prom_a_db"], r["prom_b_db"]))
+            self.ab_fig.tight_layout()
+            self.ab_canvas.draw()
+            self.ab_status.config(text="пік A: %.3f МГц (смуга %.3f МГц) · виразність піка %.1f → %.1f дБ · придушення %+.1f дБ"
+                                  % (r["f_hz"] / 1e6, r["bw_hz"] / 1e6, r["prom_a_db"], r["prom_b_db"], r["suppress_db"]))
+            self._set_status("A/B: придушення %+.1f дБ у смузі піка A (%.3f МГц)" % (r["suppress_db"], r["f_hz"] / 1e6))
+
+        def _pri_open(self):
+            win, top, _lbl = self._win("PRI-аналіз імпульсів")
+            self.pri_path = tk.StringVar(value=getattr(self, "last_raw_path", ""))
+            _lbl(top, "Файл .raw:")
+            tk.Entry(top, textvariable=self.pri_path, width=30, bg=THEME["panel2"], fg=THEME["text"],
+                     insertbackground=THEME["text"], relief="flat").pack(side="left", padx=2)
+            ttk.Button(top, text="Огляд…", command=lambda: self._pick_into(self.pri_path)).pack(side="left", padx=2)
+            row2 = tk.Frame(win, bg=THEME["panel"])
+            row2.pack(side="top", fill="x", padx=8, pady=(0, 4))
+            _lbl(row2, "fs, МГц:")
+            self.pri_fs = tk.StringVar(value=self.gen_fs.get())
+            tk.Entry(row2, textvariable=self.pri_fs, width=8, bg=THEME["panel2"], fg=THEME["text"],
+                     insertbackground=THEME["text"], relief="flat").pack(side="left", padx=2)
+            _lbl(row2, "Каналів:")
+            self.pri_nch = tk.StringVar(value=self.nch_var.get())
+            tk.Entry(row2, textvariable=self.pri_nch, width=4, bg=THEME["panel2"], fg=THEME["text"],
+                     insertbackground=THEME["text"], relief="flat").pack(side="left", padx=2)
+            _lbl(row2, "Канал №:")
+            self.pri_ch = tk.StringVar(value="0")
+            tk.Entry(row2, textvariable=self.pri_ch, width=4, bg=THEME["panel2"], fg=THEME["text"],
+                     insertbackground=THEME["text"], relief="flat").pack(side="left", padx=2)
+            _lbl(row2, "поріг, %:")
+            self.pri_thr = tk.StringVar(value="15")
+            tk.Entry(row2, textvariable=self.pri_thr, width=4, bg=THEME["panel2"], fg=THEME["text"],
+                     insertbackground=THEME["text"], relief="flat").pack(side="left", padx=2)
+            ttk.Button(row2, text="⏱ Аналізувати", style="Accent.TButton",
+                       command=self._pri_run).pack(side="left", padx=(12, 2))
+            ttk.Button(row2, text="→ у Крок 3 (період/тривалість)",
+                       command=self._pri_apply).pack(side="left", padx=2)
+            self.pri_status = tk.Label(win, text="Вимірює період слідування (PRI), тривалість і джиттер імпульсів.",
+                                       bg=THEME["panel"], fg=THEME["dim"], anchor="w")
+            self.pri_status.pack(side="bottom", fill="x")
+            self.pri_fig = Figure(figsize=(8.6, 4.6), dpi=100)
+            self.pri_ax = self.pri_fig.add_subplot(111)
+            self.pri_ax.set_title("Огиляюча — дані не обрано")
+            self.pri_canvas = FigureCanvasTkAgg(self.pri_fig, master=win)
+            self.pri_canvas.get_tk_widget().pack(side="top", fill="both", expand=True)
+            self.pri_canvas.draw()
+            self.pri_result = None
+
+        def _pri_run(self):
+            try:
+                fs_hz = parse_freq_hz(self.pri_fs.get())
+                nch = int(self.pri_nch.get())
+                ch = int(self.pri_ch.get())
+                thr = float(self.pri_thr.get()) / 100.0
+            except ValueError as e:
+                messagebox.showerror(APP_TITLE, "PRI-аналіз: %s" % e)
+                return
+            p = self.pri_path.get().strip()
+            if not p or not os.path.exists(p):
+                messagebox.showerror(APP_TITLE, "Файл .raw не знайдено: %s" % (p or "—"))
+                return
+            try:
+                col = _chan_column(p, nch, ch, max_samples=1 << 21)
+                r = pri_analyze(col, fs_hz, thr_ratio=thr)
+            except Exception as e:
+                messagebox.showerror(APP_TITLE, "PRI-аналіз: %s" % e)
+                return
+            self.pri_result = r
+            env = np.abs(col - float(np.median(col)))
+            kk = max(3, 2 * int(round(fs_hz * 1e-6)) + 1)
+            env = np.convolve(env, np.ones(kk) / float(kk), mode="same")
+            nshow = min(env.size, 400000)
+            self.pri_fig.clf()
+            ax = self.pri_fig.add_subplot(111)
+            ax.plot(np.arange(nshow) / fs_hz * 1e6, env[:nshow], lw=0.6, color="#3a7bd5")
+            ax.axhline(float(env.max()) * thr, color="#d9534f", lw=1, ls="--", label="поріг")
+            ax.set_xlabel("Час, мкс")
+            ax.set_ylabel("Огиляюча")
+            ax.legend(loc="upper right")
+            ax.set_title("PRI %.1f мкс · PW %.1f мкс · імпульсів %d · джиттер %.2f мкс"
+                         % (r["pri_us"], r["pw_us"], r["n_pulses"], r["jit_us"]))
+            self.pri_fig.tight_layout()
+            self.pri_canvas.draw()
+            self.pri_status.config(text="PRI %.2f мкс · PW %.2f мкс · імпульсів %d · джиттер %.2f мкс · частота %.1f кГц"
+                                   % (r["pri_us"], r["pw_us"], r["n_pulses"], r["jit_us"],
+                                      1000.0 / max(r["pri_us"], 1e-9)))
+            self._set_status("PRI: %.1f мкс (PW %.1f мкс, %d імп.)" % (r["pri_us"], r["pw_us"], r["n_pulses"]))
+
+        def _pri_apply(self):
+            if not self.pri_result:
+                messagebox.showinfo(APP_TITLE, "Спочатку виконайте аналіз.")
+                return
+            self.ex_per.set("%.6g" % self.pri_result["pri_us"])
+            self.ex_pw.set("%.6g" % self.pri_result["pw_us"])
+            self._set_status("PRI → Крок 3: період %.2f мкс, тривалість %.2f мкс"
+                             % (self.pri_result["pri_us"], self.pri_result["pw_us"]))
+
+        def _demod_open(self):
+            win, top, _lbl = self._win("Демодуляція аудіо (ЧМ/АМ)")
+            self.dm_path = tk.StringVar(value=getattr(self, "last_raw_path", ""))
+            _lbl(top, "Файл .raw:")
+            tk.Entry(top, textvariable=self.dm_path, width=30, bg=THEME["panel2"], fg=THEME["text"],
+                     insertbackground=THEME["text"], relief="flat").pack(side="left", padx=2)
+            ttk.Button(top, text="Огляд…", command=lambda: self._pick_into(self.dm_path)).pack(side="left", padx=2)
+            row2 = tk.Frame(win, bg=THEME["panel"])
+            row2.pack(side="top", fill="x", padx=8, pady=(0, 4))
+            _lbl(row2, "fs, МГц:")
+            self.dm_fs = tk.StringVar(value=self.gen_fs.get())
+            tk.Entry(row2, textvariable=self.dm_fs, width=8, bg=THEME["panel2"], fg=THEME["text"],
+                     insertbackground=THEME["text"], relief="flat").pack(side="left", padx=2)
+            _lbl(row2, "Каналів:")
+            self.dm_nch = tk.StringVar(value=self.nch_var.get())
+            tk.Entry(row2, textvariable=self.dm_nch, width=4, bg=THEME["panel2"], fg=THEME["text"],
+                     insertbackground=THEME["text"], relief="flat").pack(side="left", padx=2)
+            _lbl(row2, "Канал №:")
+            self.dm_ch = tk.StringVar(value="0")
+            tk.Entry(row2, textvariable=self.dm_ch, width=4, bg=THEME["panel2"], fg=THEME["text"],
+                     insertbackground=THEME["text"], relief="flat").pack(side="left", padx=2)
+            _lbl(row2, "тип:")
+            self.dm_mode = ttk.Combobox(row2, values=("ЧМ (FM)", "АМ (AM)"), width=8, state="readonly")
+            self.dm_mode.current(0)
+            self.dm_mode.pack(side="left", padx=2)
+            _lbl(row2, "девіація, кГц:")
+            self.dm_dev = tk.StringVar(value="75")
+            tk.Entry(row2, textvariable=self.dm_dev, width=6, bg=THEME["panel2"], fg=THEME["text"],
+                     insertbackground=THEME["text"], relief="flat").pack(side="left", padx=2)
+            _lbl(row2, "декімація:")
+            self.dm_dec = tk.StringVar(value="64")
+            tk.Entry(row2, textvariable=self.dm_dec, width=5, bg=THEME["panel2"], fg=THEME["text"],
+                     insertbackground=THEME["text"], relief="flat").pack(side="left", padx=2)
+            ttk.Button(row2, text="🔊 Демодулювати і зберегти…", style="Accent.TButton",
+                       command=self._demod_save).pack(side="left", padx=(12, 2))
+            self.dm_status = tk.Label(win, text="Результат — моно WAV 16 біт для прослуховування.",
+                                      bg=THEME["panel"], fg=THEME["dim"], anchor="w")
+            self.dm_status.pack(side="bottom", fill="x")
+
+        def _demod_save(self):
+            out = filedialog.asksaveasfilename(defaultextension=".wav", initialfile="demod.wav",
+                                               title="Куди зберегти аудіо",
+                                               filetypes=[("WAV аудіо", "*.wav")])
+            if out:
+                self._demod_run(out)
+
+        def _demod_run(self, out_path):
+            try:
+                fs_hz = parse_freq_hz(self.dm_fs.get())
+                nch = int(self.dm_nch.get())
+                ch = int(self.dm_ch.get())
+                dev = parse_freq_hz(self.dm_dev.get())
+                dec = max(1, int(self.dm_dec.get()))
+            except ValueError as e:
+                messagebox.showerror(APP_TITLE, "Демодуляція: %s" % e)
+                return False
+            p = self.dm_path.get().strip()
+            if not p or not os.path.exists(p):
+                messagebox.showerror(APP_TITLE, "Файл .raw не знайдено: %s" % (p or "—"))
+                return False
+            try:
+                col = _chan_column(p, nch, ch)
+                mode = "am" if self.dm_mode.get().startswith("АМ") else "fm"
+                a = demod_audio(col, fs_hz, mode=mode, fm_dev_hz=dev, decim=dec)
+                rate = max(1000, int(fs_hz / dec))
+                save_wav_int16(out_path, a, rate)
+            except Exception as e:
+                messagebox.showerror(APP_TITLE, "Демодуляція: %s" % e)
+                return False
+            self.dm_status.config(text="збережено: %s (%d відліків, %.1f кГц, %.1f с)"
+                                  % (os.path.basename(out_path), a.size, rate / 1e3, a.size / float(rate)))
+            self._set_status("демодуляція: %s" % os.path.basename(out_path))
+            return True
+
+        def _batch_open(self):
+            win, top, _lbl = self._win("Батч-аналіз теки .raw")
+            self.bt_dir = tk.StringVar(value="")
+            _lbl(top, "Тека з .raw:")
+            tk.Entry(top, textvariable=self.bt_dir, width=34, bg=THEME["panel2"], fg=THEME["text"],
+                     insertbackground=THEME["text"], relief="flat").pack(side="left", padx=2)
+            ttk.Button(top, text="Огляд…", command=self._batch_pick).pack(side="left", padx=2)
+            row2 = tk.Frame(win, bg=THEME["panel"])
+            row2.pack(side="top", fill="x", padx=8, pady=(0, 4))
+            _lbl(row2, "fs, МГц:")
+            self.bt_fs = tk.StringVar(value=self.gen_fs.get())
+            tk.Entry(row2, textvariable=self.bt_fs, width=8, bg=THEME["panel2"], fg=THEME["text"],
+                     insertbackground=THEME["text"], relief="flat").pack(side="left", padx=2)
+            _lbl(row2, "Каналів:")
+            self.bt_nch = tk.StringVar(value=self.nch_var.get())
+            tk.Entry(row2, textvariable=self.bt_nch, width=4, bg=THEME["panel2"], fg=THEME["text"],
+                     insertbackground=THEME["text"], relief="flat").pack(side="left", padx=2)
+            _lbl(row2, "Канал №:")
+            self.bt_ch = tk.StringVar(value="0")
+            tk.Entry(row2, textvariable=self.bt_ch, width=4, bg=THEME["panel2"], fg=THEME["text"],
+                     insertbackground=THEME["text"], relief="flat").pack(side="left", padx=2)
+            ttk.Button(row2, text="🗂 Сканувати теку", style="Accent.TButton",
+                       command=self._batch_run).pack(side="left", padx=(12, 2))
+            self.bt_status = tk.Label(win, text="CSV-зведення зберігається автоматично: <тека>/batch_report.csv",
+                                      bg=THEME["panel"], fg=THEME["dim"], anchor="w")
+            self.bt_status.pack(side="bottom", fill="x")
+            self.bt_fig = Figure(figsize=(8.6, 4.4), dpi=100)
+            self.bt_ax = self.bt_fig.add_subplot(111)
+            self.bt_ax.set_title("Піки по файлах — немає даних")
+            self.bt_canvas = FigureCanvasTkAgg(self.bt_fig, master=win)
+            self.bt_canvas.get_tk_widget().pack(side="top", fill="both", expand=True)
+            self.bt_canvas.draw()
+            self.batch_rows = []
+
+        def _batch_pick(self):
+            d = filedialog.askdirectory(title="Тека з .raw записами")
+            if d:
+                self.bt_dir.set(d)
+
+        def _batch_run(self):
+            try:
+                fs_hz = parse_freq_hz(self.bt_fs.get())
+                nch = int(self.bt_nch.get())
+                ch = int(self.bt_ch.get())
+            except ValueError as e:
+                messagebox.showerror(APP_TITLE, "Батч-аналіз: %s" % e)
+                return
+            d = self.bt_dir.get().strip()
+            try:
+                rows = batch_scan(d, fs_hz, nch=nch, ch=ch)
+            except Exception as e:
+                messagebox.showerror(APP_TITLE, "Батч-аналіз: %s" % e)
+                return
+            self.batch_rows = rows
+            csvp = os.path.join(d, "batch_report.csv")
+            try:
+                batch_save_csv(csvp, rows)
+            except OSError as e:
+                csvp = ""
+            self.bt_fig.clf()
+            ax = self.bt_fig.add_subplot(111)
+            if rows:
+                ax.scatter(range(len(rows)), [r["f_hz"] / 1e6 for r in rows],
+                           c=[r["peak_rel_db"] for r in rows], cmap="viridis", s=42)
+                ax.set_xticks(range(min(len(rows), 12)))
+                ax.set_xticklabels([r["name"][:12] for r in rows[:12]], rotation=30, fontsize=7)
+            ax.set_ylabel("Пік, МГц")
+            ax.set_title("Піки по файлах (%d .raw)" % len(rows))
+            self.bt_fig.tight_layout()
+            self.bt_canvas.draw()
+            self.bt_status.config(text="файлів: %d · CSV: %s" % (len(rows), csvp or "—"))
+            self._set_status("батч: %d файлів, CSV %s" % (len(rows), os.path.basename(csvp) if csvp else "—"))
+
+        def _power_opt_open(self):
+            win, top, _lbl = self._win("Оптимізатор потужності завади", 760, 320)
+            row2 = tk.Frame(win, bg=THEME["panel"])
+            row2.pack(side="top", fill="x", padx=8, pady=(2, 4))
+            _lbl(row2, "частота завади, МГц:")
+            self.pf_f = tk.StringVar(value="2400")
+            tk.Entry(row2, textvariable=self.pf_f, width=8, bg=THEME["panel2"], fg=THEME["text"],
+                     insertbackground=THEME["text"], relief="flat").pack(side="left", padx=2)
+            _lbl(row2, "J/S, дБ:")
+            self.pf_js = tk.StringVar(value=self.jq_js.get())
+            tk.Entry(row2, textvariable=self.pf_js, width=5, bg=THEME["panel2"], fg=THEME["text"],
+                     insertbackground=THEME["text"], relief="flat").pack(side="left", padx=2)
+            _lbl(row2, "дальність, км:")
+            self.pf_d = tk.StringVar(value=self.jq_optd.get())
+            tk.Entry(row2, textvariable=self.pf_d, width=5, bg=THEME["panel2"], fg=THEME["text"],
+                     insertbackground=THEME["text"], relief="flat").pack(side="left", padx=2)
+            _lbl(row2, "поріг приймача, дБм:")
+            self.pf_thr = tk.StringVar(value=self.jq_thr.get())
+            tk.Entry(row2, textvariable=self.pf_thr, width=6, bg=THEME["panel2"], fg=THEME["text"],
+                     insertbackground=THEME["text"], relief="flat").pack(side="left", padx=2)
+            _lbl(row2, "G антени, дБі:")
+            self.pf_g = tk.StringVar(value=self.jq_ant_g.get())
+            tk.Entry(row2, textvariable=self.pf_g, width=5, bg=THEME["panel2"], fg=THEME["text"],
+                     insertbackground=THEME["text"], relief="flat").pack(side="left", padx=2)
+            _lbl(row2, "BW завади:")
+            self.pf_bwj = tk.StringVar(value="20")
+            tk.Entry(row2, textvariable=self.pf_bwj, width=7, bg=THEME["panel2"], fg=THEME["text"],
+                     insertbackground=THEME["text"], relief="flat").pack(side="left", padx=2)
+            _lbl(row2, "BW сигналу, МГц:")
+            self.pf_bws = tk.StringVar(value=self.bw_var.get())
+            tk.Entry(row2, textvariable=self.pf_bws, width=7, bg=THEME["panel2"], fg=THEME["text"],
+                     insertbackground=THEME["text"], relief="flat").pack(side="left", padx=2)
+            row3 = tk.Frame(win, bg=THEME["panel"])
+            row3.pack(side="top", fill="x", padx=8, pady=2)
+            ttk.Button(row3, text="🎯 Розрахувати", style="Accent.TButton",
+                       command=self._popt_calc).pack(side="left", padx=2)
+            ttk.Button(row3, text="→ у поле «ПП, дБм»",
+                       command=self._popt_apply).pack(side="left", padx=8)
+            self.lbl_pf = tk.Label(win, text="", bg=THEME["panel"], fg=THEME["accent"],
+                                   anchor="w", font=("DejaVu Sans", 10, "bold"))
+            self.lbl_pf.pack(side="top", fill="x", padx=10, pady=6)
+            self._popt_last = None
+
+        def _popt_calc(self):
+            try:
+                f = parse_freq_hz(self.pf_f.get())
+                js = float(self.pf_js.get())
+                dkm = float(self.pf_d.get())
+                thr = float(self.pf_thr.get())
+                g = float(self.pf_g.get())
+                bwj = parse_freq_hz(self.pf_bwj.get())
+                bws = parse_freq_hz(self.pf_bws.get())
+            except ValueError as e:
+                messagebox.showerror(APP_TITLE, "Оптимізатор: %s" % e)
+                return
+            r = power_optimize(js, thr, f, dkm, g, 0.0, bwj, bws)
+            self._popt_last = r
+            self.lbl_pf.config(text="Мінімальна потужність ПП: %.1f дБм (EIRP %.1f дБм) — FSPL %.1f дБ, корекція смуги %+.1f дБ"
+                               % (r["p_req_dbm"], r["eirp_dbm"], r["fspl_db"], r["corr_db"]))
+            self._set_status("оптимізатор: ПП %.1f дБм на %.3g км (J/S %+.0f дБ)"
+                             % (r["p_req_dbm"], dkm, js))
+
+        def _popt_apply(self):
+            if not self._popt_last:
+                messagebox.showinfo(APP_TITLE, "Спочатку натисніть «Розрахувати».")
+                return
+            self.jq_pa.set("%.1f" % self._popt_last["p_req_dbm"])
+            self._set_status("ПП → %.1f дБм (оптимізатор)" % self._popt_last["p_req_dbm"])
+
+        def _map3d_open(self):
+            win, top, _lbl = self._win("3D-мапа покриття (FSPL)")
+            row2 = tk.Frame(win, bg=THEME["panel"])
+            row2.pack(side="top", fill="x", padx=8, pady=(2, 4))
+            _lbl(row2, "частота завади, МГц:")
+            self.m3_f = tk.StringVar(value="2400")
+            tk.Entry(row2, textvariable=self.m3_f, width=8, bg=THEME["panel2"], fg=THEME["text"],
+                     insertbackground=THEME["text"], relief="flat").pack(side="left", padx=2)
+            ttk.Button(row2, text="⛰ Побудувати 3D", style="Accent.TButton",
+                       command=self._map3d_run).pack(side="left", padx=(12, 2))
+            self.m3_status = tk.Label(win, text="EIRP = ПП + підсилювач + G антени (з Кроку 2в); запас над порігом у дБ.",
+                                      bg=THEME["panel"], fg=THEME["dim"], anchor="w")
+            self.m3_status.pack(side="bottom", fill="x")
+            self.m3_fig = Figure(figsize=(8.6, 5.0), dpi=100)
+            self.m3_ax = self.m3_fig.add_subplot(111, projection="3d")
+            self.m3_ax.set_title("3D-мапа покриття — немає даних")
+            self.m3_canvas = FigureCanvasTkAgg(self.m3_fig, master=win)
+            self.m3_canvas.get_tk_widget().pack(side="top", fill="both", expand=True)
+            self.m3_canvas.draw()
+            self.map3d_done = False
+
+        def _map3d_run(self):
+            try:
+                f = parse_freq_hz(self.m3_f.get())
+                pa = float(self.jq_pa.get())
+                amp = float(self.jq_amp.get())
+                gant = float(self.jq_ant_g.get())
+                thr = float(self.jq_thr.get())
+                hpb = float(self.jq_hpb.get())
+                fbr = float(self.jq_fbr.get())
+            except ValueError as e:
+                messagebox.showerror(APP_TITLE, "3D-мапа: %s" % e)
+                return
+            ant = self.jq_ant.get()
+            if ant == "Інший (власноруч)":
+                ant = ""
+            eirp = pa + amp + gant
+            angs, rads, M = coverage_map3d(eirp, thr, f, ant_name=ant, hpb=hpb, fbr=fbr,
+                                           g_rx_db=0.0)
+            self.m3_fig.clf()
+            ax = self.m3_fig.add_subplot(111, projection="3d")
+            A, R = np.meshgrid(angs, rads)
+            ax.plot_surface(A, R, M.T, cmap="viridis", linewidth=0, antialiased=True)
+            ax.set_xlabel("Кут, °")
+            ax.set_ylabel("Дальність, км")
+            ax.set_zlabel("Запас, дБ")
+            ax.set_title("3D-мапа покриття: EIRP %.1f дБм, поріг %.0f дБм, f %.3g МГц"
+                         % (eirp, thr, f / 1e6))
+            self.m3_fig.tight_layout()
+            self.m3_canvas.draw()
+            self.map3d_done = True
+            self.m3_status.config(text="EIRP %.1f дБм · запас 0 дБ = межа прийому; макс. дальність %.1f км"
+                                  % (eirp, float(rads[-1])))
+            self._set_status("3D-мапа покриття: EIRP %.1f дБм" % eirp)
+
+        def _tl_preset_apply(self):
+            nm = self.tl_preset.get()
+            for p in SCENARIO_PRESETS:
+                if p["name"] == nm:
+                    self.tl_phases = scenario_parse_phases(p["phases"])
+                    self._tl_redraw()
+                    self._set_status("сценарій-пресет: %s — %d фаз" % (nm, len(self.tl_phases)))
+                    return
+            self._set_status("сценарій-пресет не знайдено: %s" % nm)
+
+        def _prof_save(self):
+            out = filedialog.asksaveasfilename(defaultextension=".rprofile",
+                                               initialfile="session.rprofile",
+                                               title="Зберегти профіль сесії",
+                                               filetypes=[("Профіль сесії RAW Studio", "*.rprofile"),
+                                                          ("JSON", "*.json")])
+            if not out:
+                return
+            rows = []
+            for i, (en, kd, vals) in enumerate(self.gen_rows):
+                rows.append({"enabled": bool(en.get()), "kind": kd.get(),
+                             "vals": [v.get() for v in vals], "extra": self.ch_extra.get(i)})
+            data = {"app": "RAW Studio", "version": APP_VERSION, "type": "session-profile",
+                    "theme": getattr(self, "theme_saved", "techno"),
+                    "fs_mhz": self.gen_fs.get(), "dur_s": self.gen_dur.get(),
+                    "seed": self.gen_seed.get(),
+                    "rows": rows, "phases": self.tl_phases,
+                    "jq": {"pa": self.jq_pa.get(), "amp": self.jq_amp.get(),
+                           "dist": self.jq_dist.get(), "dj": self.jq_dj.get(),
+                           "ant_g": self.jq_ant_g.get(), "thr": self.jq_thr.get()},
+                    "krok3": {"per_us": self.ex_per.get(), "pw_us": self.ex_pw.get(),
+                              "rgpo_v": self.ex_rgpo_v.get(), "rgpo_d": self.ex_rgpo_d.get(),
+                              "vgpo_f": self.ex_vgpo_f.get(), "vgpo_t": self.ex_vgpo_t.get(),
+                              "protect": self.ex_protect.get(), "siglvl": self.ex_siglvl.get()}}
+            try:
+                with open(out, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+            except OSError as e:
+                messagebox.showerror(APP_TITLE, "Не вдалося зберегти профіль: %s" % e)
+                return
+            self._set_status("профіль сесії збережено: %s (%d каналів, %d фаз)"
+                             % (os.path.basename(out), len(rows), len(self.tl_phases)))
+
+        def _prof_load(self):
+            p = filedialog.askopenfilename(title="Завантажити профіль сесії",
+                                           filetypes=[("Профіль сесії RAW Studio", "*.rprofile *.json"),
+                                                      ("Усі файли", "*.*")])
+            if not p or not os.path.exists(p):
+                return
+            try:
+                with open(p, encoding="utf-8") as f:
+                    data = json.load(f)
+                if data.get("type") != "session-profile":
+                    raise ValueError("файл не є профілем сесії")
+            except Exception as e:
+                messagebox.showerror(APP_TITLE, "Профіль сесії: %s" % e)
+                return
+            rows = data.get("rows") or []
+            self.ch_extra = {}
+            for i, (en, kd, vals) in enumerate(self.gen_rows):
+                if i < len(rows):
+                    r = rows[i]
+                    en.set(bool(r.get("enabled")))
+                    if r.get("kind") in WAVE_KINDS:
+                        kd.set(r["kind"])
+                    for v, sv in zip(vals, r.get("vals") or []):
+                        v.set(str(sv))
+                    if r.get("extra"):
+                        self.ch_extra[i] = {k: float(x) for k, x in r["extra"].items()}
+                if i < len(self.ch_extra_btns):
+                    self.ch_extra_btns[i].configure(text="⚙*" if i in self.ch_extra else "⚙")
+            for var, key in ((self.gen_fs, "fs_mhz"), (self.gen_dur, "dur_s"), (self.gen_seed, "seed")):
+                if str(data.get(key) or "") != "":
+                    var.set(str(data[key]))
+            jq = data.get("jq") or {}
+            for var, key in ((self.jq_pa, "pa"), (self.jq_amp, "amp"), (self.jq_dist, "dist"),
+                             (self.jq_dj, "dj"), (self.jq_ant_g, "ant_g"), (self.jq_thr, "thr")):
+                if str(jq.get(key) or "") != "":
+                    var.set(str(jq[key]))
+            k3 = data.get("krok3") or {}
+            for var, key in ((self.ex_per, "per_us"), (self.ex_pw, "pw_us"),
+                             (self.ex_rgpo_v, "rgpo_v"), (self.ex_rgpo_d, "rgpo_d"),
+                             (self.ex_vgpo_f, "vgpo_f"), (self.ex_vgpo_t, "vgpo_t"),
+                             (self.ex_protect, "protect"), (self.ex_siglvl, "siglvl")):
+                if str(k3.get(key) or "") != "":
+                    var.set(str(k3[key]))
+            self.tl_phases = scenario_parse_phases(data.get("phases") or [])
+            self._tl_redraw()
+            self._set_status("профіль сесії завантажено: %s (%d каналів, %d фаз)"
+                             % (os.path.basename(p), len(rows), len(self.tl_phases)))
+
         def _specgram_open(self):
             _w = getattr(self, "spg_win", None)
             if _w is not None:
@@ -6135,6 +8030,8 @@ def run_gui(path=None, fs=DEFAULT_FS, nch=DEFAULT_NCH):
                        command=self._specgram_build).pack(side="left", padx=12)
             ttk.Button(row2, text="💾 Експорт PNG…",
                        command=self._specgram_export).pack(side="left", padx=2)
+            ttk.Button(row2, text="⛰ 3D-побудова",
+                       command=self._specgram_3d).pack(side="left", padx=2)
             self.spg_status = tk.Label(w, text="Оберіть .raw і натисніть «Побудувати».",
                                        bg=THEME["panel"], fg=THEME["dim"], anchor="w")
             self.spg_status.pack(side="bottom", fill="x")
@@ -6253,6 +8150,344 @@ def run_gui(path=None, fs=DEFAULT_FS, nch=DEFAULT_NCH):
                 def showinfo(self2, *a, **k): return _mbx.showinfo(*a, parent=_p, **k)
             return _Wrap()
 
+        def _metric_open(self, show_info=True):
+            _mb = self._msgbox()
+            rows = []
+            for _i, (_en, _kd, _vals) in enumerate(self.gen_rows):
+                if not bool(_en.get()):
+                    continue
+                try:
+                    _f = parse_freq_hz(_vals[0].get())
+                except ValueError:
+                    continue
+                _bw = 0.0
+                try:
+                    _cd = self.ch_extra.get(_i) or {}
+                    _bw = float(_cd.get("jam_bw", 0) or 0)
+                except (TypeError, ValueError):
+                    _bw = 0.0
+                if _bw <= 0:
+                    try:
+                        _bw = parse_freq_hz(self.ex_jam_bw.get())
+                    except (ValueError, AttributeError):
+                        _bw = 0.0
+                if _bw <= 0:
+                    _bw = 20e6
+                try:
+                    _a = float(_vals[2].get())
+                except ValueError:
+                    _a = 0.0
+                rows.append((_f, _bw, _a))
+            try:
+                _ref = float(self.ex_siglvl.get())
+            except (ValueError, AttributeError):
+                _ref = None
+            m = coverage_metric(rows, _ref)
+            _txt = "Покриття плану: %.1f%%" % m["pct"]
+            if m["holes"]:
+                _txt += "; діри: " + ", ".join("%.4g–%.4g МГц" % (lo / 1e6, hi / 1e6)
+                                               for lo, hi in m["holes"])
+            _txt += "; J/S: " + (", ".join("ch%d %+.1f дБ" % (i, v)
+                                           for i, v in enumerate(m["js"])) if m["js"] else "—")
+            self._set_status(_txt)
+            if show_info:
+                _mb.showinfo(APP_TITLE, _txt)
+            return m
+
+        def _map_open(self):
+            try:
+                _pa = float(self.jq_pa.get())
+            except ValueError:
+                _pa = 20.0
+            try:
+                _pv = float(self.jq_amp.get())
+            except ValueError:
+                _pv = 0.0
+            try:
+                _g = float(self.jq_ant_g.get())
+            except ValueError:
+                _g = 0.0
+            try:
+                _thr = float(self.jq_thr.get())
+            except ValueError:
+                _thr = -85.0
+            _f = 0.0
+            for _en, _kd, _vals in self.gen_rows:
+                if bool(_en.get()):
+                    try:
+                        _f = parse_freq_hz(_vals[0].get())
+                        break
+                    except ValueError:
+                        pass
+            if _f <= 0:
+                _f = 1000e6
+            _hpb, _fbr = 60.0, 20.0
+            try:
+                _hpb = float(self.jq_hpb.get())
+                _fbr = float(self.jq_fbr.get())
+            except ValueError:
+                pass
+            _an = self.jq_ant.get() if self.jq_ant.get() in JQ_ANTENNAS else ""
+            degs, rs = coverage_map(_pa + _pv + _g, _thr, _f, ant_name=_an,
+                                    hpb=_hpb, fbr=_fbr, n_pts=181)
+            self.map_data = (degs, rs)
+            try:
+                from matplotlib.figure import Figure
+                from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+                win = tk.Toplevel(self)
+                win.title("Мапа покриття (полярна × FSPL)")
+                win.geometry("760x620")
+                fig = Figure(figsize=(7.0, 5.4), dpi=100)
+                ax = fig.add_subplot(111, projection="polar")
+                _th = np.radians(np.concatenate([degs, [360.0]]))
+                _rr = np.concatenate([rs, [rs[0]]])
+                ax.plot(_th, _rr, color="#e05050", lw=1.6)
+                ax.fill(_th, _rr, color="#e05050", alpha=0.25)
+                ax.set_title("Дальність завади, км × кут (EIRP %.1f дБм, поріг %.1f дБм, f %.4g МГц)"
+                             % (_pa + _pv + _g, _thr, _f / 1e6), fontsize=9)
+                self.map_win = win
+                FigureCanvasTkAgg(fig, master=win).get_tk_widget().pack(fill="both", expand=True)
+            except Exception:
+                pass
+            self._set_status("мапа покриття: макс %.1f км, мін %.1f км (EIRP %.1f дБм, поріг %.1f дБм)"
+                             % (float(rs.max()), float(rs.min()), _pa + _pv + _g, _thr))
+            return degs, rs
+
+        def _pdf_open(self):
+            _mb = self._msgbox()
+            params = []
+            for _en, _kd, _vals in self.gen_rows:
+                try:
+                    params.append({"enabled": bool(_en.get()), "kind": _kd.get(),
+                                   "freq": parse_freq_hz(_vals[0].get()),
+                                   "phase": float(_vals[1].get()), "amp": float(_vals[2].get()),
+                                   "width_us": float(_vals[3].get()), "dc": float(_vals[4].get()),
+                                   "gain": float(_vals[5].get())})
+                except ValueError:
+                    params.append({"enabled": False, "kind": "Синус", "freq": 0.0,
+                                   "phase": 0.0, "amp": 0.0, "width_us": 0.0,
+                                   "dc": 32768.0, "gain": 1.0})
+            _m = self._metric_open(show_info=False) if any(bool(_e.get()) for _e, _k, _v
+                                                           in self.gen_rows) else None
+            out = filedialog.asksaveasfilename(
+                parent=self, defaultextension=".pdf", initialfile="report_plan.pdf",
+                title="Куди зберегти звіт PDF", filetypes=[("PDF файли", "*.pdf")])
+            if not out:
+                return
+            _png_m = _png_s = None
+            try:
+                import tempfile
+                from matplotlib.figure import Figure
+                _d = tempfile.mkdtemp(prefix="rs_pdf_")
+                _map = getattr(self, "map_data", None)
+                if _map is not None:
+                    _fg = Figure(figsize=(6.0, 4.8), dpi=100)
+                    _ax = _fg.add_subplot(111, projection="polar")
+                    _th = np.radians(np.concatenate([_map[0], [360.0]]))
+                    _rr = np.concatenate([_map[1], [_map[1][0]]])
+                    _ax.plot(_th, _rr, color="#cc3333", lw=1.4)
+                    _ax.fill(_th, _rr, color="#cc3333", alpha=0.25)
+                    _png_m = os.path.join(_d, "map.png")
+                    _fg.savefig(_png_m)
+                _en_rows = [p for p in params if p["enabled"]]
+                if _en_rows:
+                    _fg = Figure(figsize=(6.6, 2.8), dpi=100)
+                    _ax = _fg.add_subplot(111)
+                    for _i, _p in enumerate(_en_rows):
+                        _ax.plot([_p["freq"] / 1e6], [_p["amp"]], "v",
+                                 color="C%d" % (_i % 10), ms=8)
+                        _ax.annotate("ch%d %.4g МГц" % (_i, _p["freq"] / 1e6),
+                                     (_p["freq"] / 1e6, _p["amp"]), fontsize=7,
+                                     rotation=90, va="bottom")
+                    _ax.set_xlabel("Частота, МГц")
+                    _ax.set_ylabel("Ампл., кодів")
+                    _ax.set_title("Канали плану завад", fontsize=9)
+                    _png_s = os.path.join(_d, "spec.png")
+                    _fg.savefig(_png_s)
+            except Exception:
+                pass
+            _spec3d = _map3d = _vs3d = None
+            try:
+                _lraw = getattr(self, "last_raw_path", "")
+                if _lraw and os.path.exists(_lraw):
+                    _spec3d = {"raw_path": _lraw,
+                               "fs_hz": parse_freq_hz(self.gen_fs.get()),
+                               "nch": int(self.nch_var.get() or 1), "ch": 0}
+            except Exception:
+                _spec3d = None
+            try:
+                _f53s = getattr(self, "m3_f", None)
+                _f53 = parse_freq_hz(_f53s.get() if _f53s else "2400")
+                _ant53 = self.jq_ant.get()
+                _map3d = {"eirp_dbm": float(self.jq_pa.get()) + float(self.jq_amp.get())
+                          + float(self.jq_ant_g.get()),
+                          "thresh_dbm": float(self.jq_thr.get()), "f_hz": _f53,
+                          "ant_name": (_ant53 if _ant53 != "Інший (власноруч)" else ""),
+                          "hpb": float(self.jq_hpb.get()), "fbr": float(self.jq_fbr.get())}
+            except Exception:
+                _map3d = None
+            try:
+                _vr = getattr(self, "vs_result", None)
+                if _vr and _vr.get("raw_path") and os.path.exists(_vr["raw_path"]):
+                    _vs3d = {"raw_path": _vr["raw_path"], "fs_hz": _vr.get("fs_hz", 8e6),
+                             "nch": _vr.get("nch", 1), "ch": _vr.get("ch", 0),
+                             "jam_f_hz": _vr.get("jf", 0.0), "jam_bw_hz": _vr.get("jbw", 20e6),
+                             "js_db": _vr.get("js_db", 15.0)}
+            except Exception:
+                _vs3d = None
+            build_pdf_report(out, params, metric=_m, map_png=_png_m, spec_png=_png_s,
+                             meta=self.cb_sdr.get() if getattr(self, "cb_sdr", None) else None,
+                             spec3d=_spec3d, map3d=_map3d, vs3d=_vs3d)
+            self._set_status("звіт PDF: %s" % os.path.basename(out))
+            _mb.showinfo(APP_TITLE, "Звіт збережено: %s" % out)
+
+        def _tl_add(self):
+            try:
+                _t = float(self.tl_t.get())
+                _chs = [int(x) for x in self.tl_ch.get().replace(" ", "").split(",") if x != ""]
+                _v = float(self.tl_v.get() or 0)
+                _d = float(self.tl_d.get() or 0)
+            except ValueError:
+                self._set_status("сценарій: невірна тривалість, канали, швидкість або дальність")
+                return
+            if _t <= 0:
+                self._set_status("сценарій: тривалість має бути > 0")
+                return
+            self.tl_phases.append({"t": _t, "ch": _chs, "v": _v, "d": _d})
+            self._tl_redraw()
+
+        def _tl_del(self):
+            if self.tl_phases:
+                self.tl_phases.pop()
+                self._tl_redraw()
+
+        def _tl_clear(self):
+            self.tl_phases = []
+            self._tl_redraw()
+
+        def _tl_redraw(self):
+            try:
+                self.tl_list.config(state="normal")
+                self.tl_list.delete("1.0", "end")
+                _t0 = 0.0
+                for _i, _ph in enumerate(self.tl_phases):
+                    _vd = ""
+                    if float(_ph.get("v", 0) or 0) != 0.0 or float(_ph.get("d", 0) or 0) != 0.0:
+                        _vd = " v=%g м/с d=%g км" % (float(_ph.get("v", 0) or 0),
+                                                     float(_ph.get("d", 0) or 0))
+                    self.tl_list.insert(
+                        "end", "фаза %d: %g с (t %g–%g) канали %s%s\n"
+                        % (_i, _ph["t"], _t0, _t0 + _ph["t"],
+                           ",".join(str(c) for c in _ph["ch"]), _vd))
+                    _t0 += _ph["t"]
+                cv = self.tl_cv
+                cv.delete("all")
+                _tot = sum(_ph["t"] for _ph in self.tl_phases) or 1.0
+                _w = max(int(cv.winfo_width() or 600), 200)
+                _cols = ("#4a90d9", "#d94a4a", "#4ad96a", "#d9c84a", "#9a4ad9", "#4ad9c8")
+                _t0 = 0.0
+                for _i, _ph in enumerate(self.tl_phases):
+                    _x0 = _t0 / _tot * _w
+                    _x1 = (_t0 + _ph["t"]) / _tot * _w
+                    cv.create_rectangle(_x0, 2, max(_x1, _x0 + 2), 24,
+                                        fill=_cols[_i % len(_cols)], outline="")
+                    cv.create_text(max((_x0 + _x1) / 2, 2), 13,
+                                   text="%gс ch%s" % (_ph["t"], ",".join(str(c) for c in _ph["ch"])),
+                                   fill="#ffffff", font=("DejaVu Sans", 7))
+                    _t0 += _ph["t"]
+            except Exception:
+                pass
+
+        def _tl_gen_params(self):
+            params = []
+            for _en, _kd, _vals in self.gen_rows:
+                try:
+                    params.append({"enabled": bool(_en.get()), "kind": _kd.get(),
+                                   "freq": parse_freq_hz(_vals[0].get()),
+                                   "phase": float(_vals[1].get()), "amp": float(_vals[2].get()),
+                                   "width_us": float(_vals[3].get()), "dc": float(_vals[4].get()),
+                                   "gain": float(_vals[5].get())})
+                except ValueError:
+                    params.append({"enabled": False, "kind": "Синус", "freq": 0.0,
+                                   "phase": 0.0, "amp": 0.0, "width_us": 0.0,
+                                   "dc": 32768.0, "gain": 1.0})
+            for _ci, _cd in getattr(self, "ch_extra", {}).items():
+                if _ci < len(params):
+                    params[_ci]["extra"] = _cd
+            return params
+
+        def _tl_save(self):
+            out = filedialog.asksaveasfilename(
+                parent=self, defaultextension=".scenario.json", initialfile="scenario.json",
+                title="Куди зберегти сценарій", filetypes=[("Сценарії", "*.json")])
+            if not out:
+                return
+            try:
+                fs_s = parse_freq_hz(self.gen_fs.get())
+            except ValueError:
+                fs_s = DEFAULT_FS
+            with open(out, "w", encoding="utf-8") as fh:
+                json.dump({"fs_hz": fs_s, "params": self._tl_gen_params(),
+                           "phases": self.tl_phases}, fh)
+            self._set_status("сценарій збережено: %s (%d фаз)"
+                             % (os.path.basename(out), len(self.tl_phases)))
+
+        def _tl_load(self):
+            pth = filedialog.askopenfilename(parent=self, title="Який сценарій відкрити",
+                                             filetypes=[("Сценарії", "*.json")])
+            if not pth or not os.path.exists(pth):
+                return
+            with open(pth, "r", encoding="utf-8") as fh:
+                d = json.load(fh)
+            self.tl_phases = scenario_parse_phases(d.get("phases", []))
+            self._tl_redraw()
+            self._set_status("сценарій: %d фаз (%s)"
+                             % (len(self.tl_phases), os.path.basename(pth)))
+
+        def _tl_generate(self):
+            _mb = self._msgbox()
+            if not self.tl_phases:
+                _mb.showinfo(APP_TITLE, "Додайте хоча б одну фазу сценарію.")
+                return
+            try:
+                fs_g = parse_freq_hz(self.gen_fs.get())
+                seed = int(self.gen_seed.get())
+            except ValueError:
+                _mb.showerror(APP_TITLE, "Невірні fs/seed")
+                return
+            try:
+                extra = {"per_us": float(self.ex_per.get()),
+                         "pw_us": float(self.ex_pw.get()),
+                         "rise_us": float(self.ex_rise.get()),
+                         "fall_us": float(self.ex_fall.get()),
+                         "am_m": float(self.ex_am_m.get()),
+                         "am_f": float(self.ex_am_f.get()),
+                         "chirp_dev": parse_freq_hz(self.ex_chirp.get()),
+                         "chirp_per_us": float(self.ex_chirp_per.get() or 0),
+                         "qam_bits": float(QAM_MAP.get(self.ex_qam.get(), 0)),
+                         "jam_bw": parse_freq_hz(self.ex_jam_bw.get()),
+                         "sp_off": float(self.ex_sp_off.get() or 0),
+                         "sp_drift": float(self.ex_sp_drift.get() or 0),
+                         "rgpo_v": float(self.ex_rgpo_v.get() or 0),
+                         "rgpo_d": float(self.ex_rgpo_d.get() or 0),
+                         "vgpo_f": float(self.ex_vgpo_f.get() or 0),
+                         "vgpo_t": float(self.ex_vgpo_t.get() or 0)}
+            except ValueError:
+                _mb.showerror(APP_TITLE, "Невірні додаткові параметри сигналу")
+                return
+            out = filedialog.asksaveasfilename(
+                parent=self, defaultextension=".raw", initialfile="scenario_out.raw",
+                title="Куди зберегти сценарій .raw", filetypes=[("RAW файли", "*.raw")])
+            if not out:
+                return
+            self._set_status("сценарій: генерую %d фаз…" % len(self.tl_phases))
+            _out, _tot = scenario_build_raw(out, self.tl_phases, self._tl_gen_params(),
+                                            fs_g, seed, extra=extra)
+            self._set_status("сценарій записано: %s (%d фаз, %d відліків)"
+                             % (os.path.basename(out), len(self.tl_phases), _tot))
+            _mb.showinfo(APP_TITLE, "Сценарій записано: %s\nфаз: %d, відліків: %d"
+                         % (out, len(self.tl_phases), _tot))
+
         def generate(self):
             _mb = self._msgbox()
             try:
@@ -6326,7 +8561,11 @@ def run_gui(path=None, fs=DEFAULT_FS, nch=DEFAULT_NCH):
                          "qam_bits": float(QAM_MAP.get(self.ex_qam.get(), 0)),
                          "jam_bw": parse_freq_hz(self.ex_jam_bw.get()),
                          "sp_off": float(self.ex_sp_off.get() or 0),
-                         "sp_drift": float(self.ex_sp_drift.get() or 0)}
+                         "sp_drift": float(self.ex_sp_drift.get() or 0),
+                         "rgpo_v": float(self.ex_rgpo_v.get() or 0),
+                         "rgpo_d": float(self.ex_rgpo_d.get() or 0),
+                         "vgpo_f": float(self.ex_vgpo_f.get() or 0),
+                         "vgpo_t": float(self.ex_vgpo_t.get() or 0)}
             except ValueError:
                 _mb.showerror(APP_TITLE, "Невірні додаткові параметри сигналу"); return
             base = os.path.dirname(self.path) if getattr(self, "path", None) else os.getcwd()
@@ -6336,7 +8575,23 @@ def run_gui(path=None, fs=DEFAULT_FS, nch=DEFAULT_NCH):
                                                filetypes=[("RAW файли", "*.raw")])
             if not out:
                 return
-            self._set_status("генерую %d×%d відліків%s…" % (n, nch_g, ", з АЧХ" if achx else ""))
+            _bad5 = []
+            try:
+                _prot5 = parse_protected_mhz(self.ex_protect.get())
+            except (ValueError, AttributeError):
+                _prot5 = []
+            if _prot5:
+                for _i5, (_e5, _k5, _v5) in enumerate(self.gen_rows):
+                    if bool(_e5.get()):
+                        try:
+                            if is_protected(parse_freq_hz(_v5[0].get()), _prot5):
+                                _bad5.append("ch%d (%s МГц)" % (_i5, _v5[0].get()))
+                        except ValueError:
+                            pass
+            self._set_status("генерую %d×%d відліків%s…%s"
+                             % (n, nch_g, ", з АЧХ" if achx else "",
+                                (" ! захищені частоти: у захищених смугах увімкнені канали — "
+                                 + ", ".join(_bad5)) if _bad5 else ""))
             if getattr(self, "audio_data", None):
                 for _key, _idx in zip(("L", "R"), getattr(self, "audio_rows", ())):
                     if (_idx < len(params) and bool(params[_idx]["enabled"])
@@ -6349,6 +8604,13 @@ def run_gui(path=None, fs=DEFAULT_FS, nch=DEFAULT_NCH):
             for _ci, _cd in getattr(self, "ch_extra", {}).items():
                 if _ci < len(params):
                     params[_ci]["extra"] = _cd
+            if getattr(self, "ex_jam_shape", None) is not None:
+                extra = dict(extra or {})
+                _jsp = self.ex_jam_shape.get().strip()
+                if _jsp and os.path.exists(_jsp):
+                    extra["jam_shape"] = _jsp
+                else:
+                    extra.pop("jam_shape", None)
             flat = generate_raw(params, n, fs_g, nch_g, seed, achx=achx, extra=extra)
             save_raw(out, flat)
             _rep = []
@@ -6383,10 +8645,38 @@ def main():
     ap.add_argument("--preview", nargs="+", metavar=("OUT_PREFIX", "FILE"))
     ap.add_argument("--calgen", nargs="+", metavar=("OUT", "fs_nch_tones_fmin_fmax_amp_seg"))
     ap.add_argument("--calmeas", nargs="+", metavar=("RECORDED", "PLAN"))
+    ap.add_argument("--scenario", nargs="+", metavar=("FILE", "OUT_fs"),
+                    help="сценарій JSON (fs_hz, seed, params, phases) -> .raw")
+    ap.add_argument("--batch", nargs="+", metavar=("DIR", "OUT_fs_nch_ch"),
+                    help="батч-аналіз теки .raw -> CSV (піки по кожному файлу)")
     args = ap.parse_args()
 
     if args.selftest is not None:
         return selftest(args.selftest[0] if args.selftest else "P-2-2.raw")
+
+    if args.scenario is not None and len(args.scenario) >= 2:
+        sfile, out = args.scenario[0], args.scenario[1]
+        fs_s = float(args.scenario[2]) if len(args.scenario) > 2 else 0.0
+        with open(sfile, "r", encoding="utf-8") as fh:
+            _d = json.load(fh)
+        fs_s = fs_s or float(_d.get("fs_hz") or DEFAULT_FS)
+        _ph = scenario_parse_phases(_d.get("phases", []))
+        _out, _tot = scenario_build_raw(out, _ph, _d.get("params", []), fs_s,
+                                        seed=int(_d.get("seed", 42)),
+                                        extra=_d.get("extra"))
+        print("сценарій: %s (%d фаз, %d відліків, %.1f МБ)"
+              % (out, len(_ph), _tot, os.path.getsize(out) / 1e6))
+        return 0
+
+    if args.batch is not None and len(args.batch) >= 2:
+        bdir, bout = args.batch[0], args.batch[1]
+        fs_b = float(args.batch[2]) if len(args.batch) > 2 else float(DEFAULT_FS)
+        nch_b = int(args.batch[3]) if len(args.batch) > 3 else 1
+        ch_b = int(args.batch[4]) if len(args.batch) > 4 else 0
+        rows_b = batch_scan(bdir, fs_b, nch=nch_b, ch=ch_b)
+        batch_save_csv(bout, rows_b)
+        print("батч: %d файлів -> %s" % (len(rows_b), bout))
+        return 0
 
     if args.headless is not None:
         p = args.headless[0]
@@ -7111,6 +9401,366 @@ def selftest(path):
     assert _m2 == "spline" and len(_p2) == 3
     os.remove(_tf)
     print("ТЕМА v3.15.0: іконка 64x64 ок, .achx тема парситься (spline, 3 точки)")
+
+    print("--- ТЕСТ ТОП-N ПІКІВ (v4.9.0) ---")
+    _iqf9 = os.path.join(tempfile.gettempdir(), "rs490.iq")
+    _fsq9, _nq9 = 8e6, 262144
+    _tq9 = np.arange(_nq9) / _fsq9
+    _sg9 = (0.4 * np.exp(2j * np.pi * (-1.5e6) * _tq9)
+            + 0.3 * np.exp(2j * np.pi * 0.6e6 * _tq9)
+            + 0.2 * np.exp(2j * np.pi * 2.2e6 * _tq9))
+    _sg9 = _sg9 + 0.01 * (np.random.default_rng(9).normal(size=_nq9)
+                          + 1j * np.random.default_rng(10).normal(size=_nq9))
+    _sg9.astype("complex64").tofile(_iqf9)
+    _r9 = iq_jam_analyze(_iqf9, dtype="float32", fs_iq=_fsq9, fc=2400e6)
+    _pf9 = [p["f_hz"] for p in _r9["peaks"]]
+    _oka9 = (len(_r9["peaks"]) >= 3
+             and any(abs(f - 2398.5e6) < 20e3 for f in _pf9)
+             and any(abs(f - 2400.6e6) < 20e3 for f in _pf9)
+             and any(abs(f - 2402.2e6) < 20e3 for f in _pf9))
+    os.remove(_iqf9)
+    print("IQ-ПІКИ v4.9.0:", "PASS" if _oka9 else "FAIL",
+          "- %d піків: %s" % (len(_pf9), ", ".join("%+.3f МГц" % ((f - 2400e6) / 1e6)
+                                                  for f in _pf9[:5])))
+    ok &= _oka9
+
+    print("--- ТЕСТ СПЕКТРАЛЬНО-ФОРМОВАНОГО ШУМУ (v4.9.0) ---")
+    _pr9 = {"freqs_hz": [2390e6, 2399e6, 2401e6, 2410e6],
+            "psd_db": [-80.0, 0.0, 0.0, -80.0], "fc": 2400e6}
+    _w9 = make_jam("jam_noise", 1 << 20, 12e9, 2400e6, 1.0, 0.0,
+                   np.random.default_rng(11), bw_hz=4e6, shape=_pr9)
+    _nf9 = 65536
+    _s9 = _w9[: ((1 << 20) // _nf9) * _nf9].reshape(-1, _nf9)
+    _p9 = (np.abs(np.fft.fft(_s9 * np.hanning(_nf9), axis=1)) ** 2).mean(axis=0)
+    _f9 = np.fft.fftfreq(_nf9, 1.0 / 12e9)
+    _in9 = _p9[np.abs(_f9 - 2400e6) < 0.9e6]
+    _out9 = _p9[(np.abs(_f9 - 2400e6) > 12e6) & (np.abs(_f9 - 2400e6) < 14e6)]
+    _c9 = 10.0 * np.log10(float(_in9.mean()) / max(float(_out9.mean()), 1e-300))
+    _okb9 = bool(_c9 > 25.0 and 0.5 < float(np.std(_w9)) < 2.0)
+    print("ШУМ-ПРОФІЛЬ v4.9.0:", "PASS" if _okb9 else "FAIL",
+          "- контраст %.1f дБ, rms %.3g" % (_c9, float(np.std(_w9))))
+    ok &= _okb9
+
+    print("--- ТЕСТ ПРОФІЛЮ .spectrum.json (v4.9.0) ---")
+    _pp9 = os.path.join(tempfile.gettempdir(), "rs490prof.json")
+    save_spectrum_profile(_pp9, [2390e6, 2399e6, 2401e6, 2410e6],
+                          [-80.0, 0.0, 0.0, -80.0], 2400e6)
+    _ld9 = load_spectrum_profile(_pp9)
+    _okc9 = (abs(_ld9["fc"] - 2400e6) < 1.0 and _ld9["freqs_hz"].size == 4
+             and abs(_ld9["psd_db"][1]) < 1e-9)
+    os.remove(_pp9)
+    print("ПРОФІЛЬ v4.9.0:", "PASS" if _okc9 else "FAIL",
+          "- fc %g Гц, %d точок" % (_ld9["fc"], _ld9["freqs_hz"].size))
+    ok &= _okc9
+
+    print("--- ТЕСТ RGPO (v5.0.0) ---")
+    _n50, _v50 = 2_400_000, 5.0e5
+    _w50 = make_rgpo(_n50, 12e9, 2e9, 1.0, 0.0, np.random.default_rng(21),
+                     per_us=50.0, pw_us=10.0, v_pull=_v50, d_max_us=50.0)
+    _idx50 = np.where(np.abs(_w50) > 0.5)[0]
+    _br50 = np.where(np.diff(_idx50) > 5000)[0]
+    _cl50 = np.split(_idx50, _br50 + 1)
+    _ok50 = len(_cl50) == 4
+    for _k50, _cl50i in enumerate(_cl50):
+        _exp50 = _k50 * 50e-6 * (1.0 + 2.0 * _v50 / 3e8) * 12e9
+        _ok50 = _ok50 and bool(abs(_cl50i[0] - _exp50) < 0.2e-6 * 12e9)
+    _w50b = make_rgpo(1 << 22, 12e9, 2e9, 1.0, 0.0, np.random.default_rng(21),
+                      per_us=50.0, pw_us=10.0, v_pull=_v50, d_max_us=1.0)
+    _idx50b = np.where(np.abs(_w50b) > 0.5)[0]
+    _br50b = np.where(np.diff(_idx50b) > 5000)[0]
+    _ok50 = _ok50 and len(np.split(_idx50b, _br50b + 1)) == 7
+    del _w50, _w50b
+    print("RGPO v5.0.0:", "PASS" if _ok50 else "FAIL",
+          "- 4 репліки з кроком 2v/c, зникнення після d_max (7 імпульсів)")
+    ok &= _ok50
+
+    print("--- ТЕСТ VGPO (v5.0.0) ---")
+    _w50v = make_vgpo(1 << 23, 5e9, 2e9, 1.0, 0.0, np.random.default_rng(22),
+                      fd_max_khz=200.0, t_pull_s=1.0e-3)
+    _nb50 = 1 << 19
+    _fa50 = np.argmax(np.abs(np.fft.rfft(_w50v[1000000:1000000 + _nb50]
+                                         * np.hanning(_nb50)))) * (5e9 / _nb50)
+    _fb50 = np.argmax(np.abs(np.fft.rfft(_w50v[4000000:4000000 + _nb50]
+                                         * np.hanning(_nb50)))) * (5e9 / _nb50)
+    _ok50v = (abs(_fa50 - 2.00005e9) < 25e3 and abs(_fb50 - 2.00017e9) < 25e3
+              and _w50v[6000000] == 0.0 and _w50v[1000000] != 0.0)
+    del _w50v
+    print("VGPO v5.0.0:", "PASS" if _ok50v else "FAIL",
+          "- піки %.6f/%.6f ГГц (очік. 2.000050/2.000170), drop після T" % (_fa50 / 1e9, _fb50 / 1e9))
+    ok &= _ok50v
+
+    print("--- ТЕСТ ЗАХИЩЕНИХ ЧАСТОТ (v5.0.0) ---")
+    _pr50 = parse_protected_mhz("1575.42, 2412-2472")
+    _ok50p = (len(_pr50) == 2 and is_protected(1575.42e6, _pr50)
+              and is_protected(2432e6, _pr50) and not is_protected(2500e6, _pr50)
+              and not is_protected(1578e6, _pr50)
+              and "Завада RGPO" in KIND_KEY and "Завада VGPO" in KIND_KEY)
+    print("ЗАХИЩЕНІ v5.0.0:", "PASS" if _ok50p else "FAIL",
+          "- %d діапазони; KIND_KEY містить RGPO/VGPO" % len(_pr50))
+    ok &= _ok50p
+
+    # --- ТЕСТ СПИСКУ ФОРМ (v5.1.0) ---
+    _ok51 = ("Завада RGPO" in WAVE_KINDS) and ("Завада VGPO" in WAVE_KINDS)
+    print("ФОРМИ v5.1.0: %s" % ("PASS" if _ok51 else "FAIL"))
+    ok = ok and _ok51
+
+    # --- ТЕСТ МЕТРИКИ ПОКРИТТЯ (v5.1.0) ---
+    _m51 = coverage_metric([(2.39e9, 4e6, 12000.0), (2.391e9, 4e6, 10000.0)], ref_db=0.0)
+    _m52 = coverage_metric([(2.39e9, 2e6, 100.0), (2.41e9, 2e6, 100.0)], ref_db=0.0)
+    _ok52 = (abs(_m51["pct"] - 100.0) < 1e-9 and not _m51["holes"]
+             and abs(_m51["js"][0] - 20.0 * math.log10(12000.0)) < 0.1
+             and _m52["pct"] < 19.0 and len(_m52["holes"]) == 1
+             and abs(_m52["holes"][0][0] - 2.391e9) < 1e3
+             and abs(_m52["holes"][0][1] - 2.409e9) < 1e3)
+    print("МЕТРИКА v5.1.0: %s (pct %.1f%%/%.1f%%, діри %d/%d)"
+          % ("PASS" if _ok52 else "FAIL", _m51["pct"], _m52["pct"],
+             len(_m51["holes"]), len(_m52["holes"])))
+    ok = ok and _ok52
+
+    # --- ТЕСТ МАПИ ПОКРИТТЯ (v5.1.0) ---
+    _dg51, _rs51 = coverage_map(50.0, -85.0, 2.4e9, ant_name="", hpb=60.0, fbr=20.0, n_pts=37)
+    _r051 = coverage_radius_km(50.0, -85.0, 2.4e9, g_ant_db=0.0)
+    _ok53 = (len(_dg51) == 37 and len(_rs51) == 37
+             and abs(float(_rs51[0]) - _r051) < max(1e-6 * _r051, 1e-9)
+             and abs(fspl_free_db(2.4e9, _r051) - 135.0) < 1e-6
+             and 0.0 < float(_rs51.min()) < float(_rs51[0]))
+    print("МАПА v5.1.0: %s (r0 %.1f км, мін %.1f км)"
+          % ("PASS" if _ok53 else "FAIL", _r051, float(_rs51.min())))
+    ok = ok and _ok53
+
+    # --- ТЕСТ ЗВІТУ PDF (v5.1.0) ---
+    _pdf51 = "/tmp/opencode/rs510_report.pdf"
+    _png51 = "/tmp/opencode/rs510_spec.png"
+    try:
+        from matplotlib.figure import Figure as _Fig51
+        _fg51 = _Fig51(figsize=(4.0, 2.0), dpi=80)
+        _ax51 = _fg51.add_subplot(111)
+        _ax51.plot([2390.0, 2400.0, 3000.0], [12000.0, 10000.0, 5000.0], "v")
+        _fg51.savefig(_png51)
+    except Exception:
+        _png51 = None
+    build_pdf_report(_pdf51,
+                     [{"enabled": True, "kind": "Завада (шум)", "freq": 2.4e9,
+                       "phase": 0.0, "amp": 12000.0, "width_us": 2.0,
+                       "dc": 32768.0, "gain": 1.0},
+                      {"enabled": False, "kind": "Синус", "freq": 852e6,
+                       "phase": 0.0, "amp": 10000.0, "width_us": 2.0,
+                       "dc": 32768.0, "gain": 1.0}],
+                     metric=_m51, spec_png=_png51)
+    from pypdf import PdfReader as _PR51
+    _np51 = len(_PR51(_pdf51).pages)
+    _ok54 = os.path.exists(_pdf51) and os.path.getsize(_pdf51) > 3000 and _np51 >= 1
+    print("ЗВІТ-PDF v5.1.0: %s (%d стр., %.0f КБ)"
+          % ("PASS" if _ok54 else "FAIL", _np51, os.path.getsize(_pdf51) / 1024.0))
+    ok = ok and _ok54
+
+    # --- ТЕСТ СЦЕНАРІЇВ + CLI (v5.1.0) ---
+    _ph51 = scenario_parse_phases([{"t": 2.0, "ch": "0,1"}, {"t": 1.0, "ch": [0]}, "3:1"])
+    _par51 = [{"enabled": True, "kind": "Синус", "freq": 2400e6, "phase": 0.0,
+               "amp": 10000.0, "width_us": 0.0, "dc": 32768.0, "gain": 1.0},
+              {"enabled": True, "kind": "Синус", "freq": 850e6, "phase": 0.0,
+               "amp": 8000.0, "width_us": 0.0, "dc": 32768.0, "gain": 1.0}]
+    _scp51 = "/tmp/opencode/rs510_scen.raw"
+    _out51, _tot51 = scenario_build_raw(
+        _scp51, [{"t": 1.0e-3, "ch": [0, 1]}, {"t": 5.0e-4, "ch": [0]}], _par51, 8e6, seed=7)
+    _arr51 = np.frombuffer(open(_scp51, "rb").read(), dtype="<u2")
+    _s151 = _arr51[:8000].astype(np.float64)
+    _s251 = _arr51[8000:].astype(np.float64)
+    _rms151 = float((_s151 - _s151.mean()).std())
+    _rms251 = float((_s251 - _s251.mean()).std())
+    import subprocess as _sp51
+    import sys as _sy51
+    _sj51 = "/tmp/opencode/rs510_cli.json"
+    with open(_sj51, "w", encoding="utf-8") as _fh51:
+        json.dump({"fs_hz": 8e6, "seed": 7, "params": _par51,
+                   "phases": [{"t": 1.0e-3, "ch": [0, 1]},
+                              {"t": 5.0e-4, "ch": [0]}]}, _fh51)
+    _pr51 = _sp51.run([_sy51.executable, "-B", os.path.abspath(__file__),
+                       "--scenario", _sj51, "/tmp/opencode/rs510_cli.raw"],
+                      capture_output=True, text=True)
+    _ok55 = (len(_ph51) == 3 and _ph51[0]["ch"] == [0, 1] and _ph51[2]["ch"] == [1]
+             and abs(_ph51[2]["t"] - 3.0) < 1e-9
+             and _tot51 == 12000 and _arr51.size == 12000
+             and _rms251 < _rms151 * 0.9
+             and _pr51.returncode == 0
+             and os.path.exists("/tmp/opencode/rs510_cli.raw")
+             and os.path.getsize("/tmp/opencode/rs510_cli.raw") == 24000)
+    print("СЦЕНАРІЙ v5.1.0: %s (3 фази, %d відл., CLI rc=%d)"
+          % ("PASS" if _ok55 else "FAIL", _tot51, _pr51.returncode))
+    ok = ok and _ok55
+
+    # --- ТЕСТ 3D-СПЕКТОГРАМИ (v5.2.0) ---
+    _raw52 = "/tmp/opencode/rs520_spec.raw"
+    _t52 = np.arange(16384) / 8e6
+    save_raw(_raw52, (np.sin(2 * np.pi * 500e3 * _t52) * 8000 + 32768).astype("<u2"))
+    _f52, _tm52, _db52, _note52 = raw_spectrogram(_raw52, 8e6, nch=1, ch=0, nfft=1024, overlap=0.5)
+    _X52, _Y52 = np.meshgrid(_tm52, _f52 / 1e6)
+    _ok520 = (_db52.shape[0] == 513 and _X52.shape == _db52.shape
+              and bool(np.isfinite(_db52).all()))
+    print("3D-СПЕКТРО v5.2.0: %s (%s)" % ("PASS" if _ok520 else "FAIL", _db52.shape))
+    ok = ok and _ok520
+
+    # --- ТЕСТ ПЕРЕКРИТТЯ ЗАВАДА/ЦІЛЬ (v5.2.0) ---
+    _o1 = jam_overlap(2390e6, 2410e6, 2400e6, 20e6)
+    _o2 = jam_overlap(2390e6, 2410e6, 2500e6, 20e6)
+    _o3 = jam_overlap(2390e6, 2410e6, 2405e6, 10e6)
+    _ok521 = (abs(_o1["pct"] - 100.0) < 1e-9 and abs(_o2["pct"]) < 1e-9
+              and _o2["f_lo"] is None and abs(_o3["pct"] - 50.0) < 1e-6
+              and _o3["f_lo"] is not None)
+    print("ПЕРЕКРИТТЯ v5.2.0: %s (pct %.0f/%.0f/%.0f%%)"
+          % ("PASS" if _ok521 else "FAIL", _o1["pct"], _o2["pct"], _o3["pct"]))
+    ok = ok and _ok521
+
+    # --- ТЕСТ ПОРІВНЯННЯ A/B (v5.2.0) ---
+    _rg52 = np.random.default_rng(5)
+    _ta52 = np.arange(65536) / 8e6
+    _nz52 = _rg52.normal(0, 250, 65536)
+    _abA = "/tmp/opencode/rs520_a.raw"
+    _abB = "/tmp/opencode/rs520_b.raw"
+    save_raw(_abA, (np.clip(np.sin(2 * np.pi * 600e3 * _ta52) * 9000 + _nz52 + 32768,
+                            0, 65535)).astype("<u2"))
+    save_raw(_abB, (np.clip(_nz52 + 32768, 0, 65535)).astype("<u2"))
+    _ab52 = ab_compare(_abA, _abB, 8e6, nfft=4096)
+    _ok522 = (_ab52["suppress_db"] > 20.0 and abs(_ab52["f_hz"] - 600e3) < 4e3
+              and _ab52["bw_hz"] > 0)
+    print("A/B v5.2.0: %s (пік %.3f МГц, придушення %+.1f дБ)"
+          % ("PASS" if _ok522 else "FAIL", _ab52["f_hz"] / 1e6, _ab52["suppress_db"]))
+    ok = ok and _ok522
+
+    # --- ТЕСТ PRI-АНАЛІЗУ (v5.2.0) ---
+    _xp52 = _rg52.normal(0, 50, 48000)
+    for _k52 in range(240):
+        _s052 = int(_k52 * 200)
+        _xp52[_s052:_s052 + 40] += 12000.0
+    _pr52 = pri_analyze(_xp52, 8e6)
+    _ok523 = (abs(_pr52["pri_us"] - 25.0) < 1.0 and abs(_pr52["pw_us"] - 5.0) < 1.5
+              and _pr52["n_pulses"] >= 200)
+    print("PRI v5.2.0: %s (PRI %.2f мкс, PW %.2f мкс, %d імп.)"
+          % ("PASS" if _ok523 else "FAIL", _pr52["pri_us"], _pr52["pw_us"], _pr52["n_pulses"]))
+    ok = ok and _ok523
+
+    # --- ТЕСТ ДЕМОДУЛЯЦІЇ ЧМ (v5.2.0) ---
+    _z52 = np.exp(1j * (0.4 * np.sin(2 * np.pi * 10e3 * _t52)))
+    _a52 = demod_audio(_z52, 8e6, mode="fm", fm_dev_hz=8e3, decim=1)
+    _fa52 = np.fft.rfftfreq(_a52.size, 1.0 / 8e6)
+    _sp52 = np.abs(np.fft.rfft(_a52.astype(np.float64)))
+    _pk52 = int(np.argmax(_sp52[1:])) + 1
+    _w52p = "/tmp/opencode/rs520_demod.wav"
+    save_wav_int16(_w52p, _a52, 8000)
+    _ok524 = (abs(_fa52[_pk52] - 10e3) < 500.0
+              and os.path.getsize(_w52p) == 44 + 2 * _a52.size
+              and _a52.dtype == np.int16)
+    print("ДЕМОД v5.2.0: %s (пік %.2f кГц, WAV %.0f КБ)"
+          % ("PASS" if _ok524 else "FAIL", _fa52[_pk52] / 1e3, os.path.getsize(_w52p) / 1024.0))
+    ok = ok and _ok524
+
+    # --- ТЕСТ МОБІЛЬНИХ ФАЗ (v5.2.0): доплер + дальність ---
+    _par52m = [{"enabled": True, "kind": "Синус", "freq": 3e6, "phase": 0.0,
+                "amp": 9000.0, "width_us": 0.0, "dc": 32768.0, "gain": 1.0}]
+    _rm1 = "/tmp/opencode/rs520_m1.raw"
+    _rm2 = "/tmp/opencode/rs520_m2.raw"
+    scenario_build_raw(_rm1, [{"t": 1.0e-3, "ch": [0], "v": 0.0, "d": 0.0}], _par52m, 8e6, seed=3)
+    scenario_build_raw(_rm2, [{"t": 1.0e-3, "ch": [0], "v": 2e6, "d": 4.0}], _par52m, 8e6, seed=3)
+    _c152 = _chan_column(_rm1)
+    _c252 = _chan_column(_rm2)
+    _fr1, _ap1 = amplitude_spectrum(_c152, 8e6, nfft=8192)
+    _fr2, _ap2 = amplitude_spectrum(_c252, 8e6, nfft=8192)
+    _sh52 = float(_fr2[int(np.argmax(_ap2))] - _fr1[int(np.argmax(_ap1))])
+    _r152 = float((_c152 - _c152.mean()).std())
+    _r252 = float((_c252 - _c252.mean()).std())
+    _ok525 = (abs(_sh52 - 20e3) < 1.2e3 and abs(_r252 * 4.0 - _r152) < _r152 * 0.1)
+    print("МОБІЛЬНІ-ФАЗИ v5.2.0: %s (зсув %+.0f Гц, rms 1/4: %.3f)"
+          % ("PASS" if _ok525 else "FAIL", _sh52, _r252 * 4.0 / _r152))
+    ok = ok and _ok525
+
+    # --- ТЕСТ ОПТИМІЗАТОРА ПОТУЖНОСТІ (v5.2.0) ---
+    _po52 = power_optimize(15.0, -85.0, 2.4e9, 10.0, 0.0, 0.0, 20e6, 1e6)
+    _fpl52 = 92.45 + 20.0 * math.log10(2.4) + 20.0 * math.log10(10.0)
+    _ok526 = (abs(_po52["p_req_dbm"] - (15.0 - 85.0 + _fpl52 + 10.0 * math.log10(20.0))) < 0.05
+              and abs(_po52["eirp_dbm"] - _po52["p_req_dbm"]) < 1e-9
+              and abs(_po52["fspl_db"] - _fpl52) < 1e-6)
+    print("ОПТИМІЗАТОР v5.2.0: %s (ПП %.1f дБм, FSPL %.1f дБ)"
+          % ("PASS" if _ok526 else "FAIL", _po52["p_req_dbm"], _po52["fspl_db"]))
+    ok = ok and _ok526
+
+    # --- ТЕСТ ГОТОВИХ СЦЕНАРІЇВ (v5.2.0) ---
+    _ok527 = len(SCENARIO_PRESETS) >= 4
+    for _sp52 in SCENARIO_PRESETS:
+        _php52 = scenario_parse_phases(_sp52["phases"])
+        if not _php52 or any(("v" not in _one or "d" not in _one) for _one in _php52):
+            _ok527 = False
+    _php0 = scenario_parse_phases([dict(SCENARIO_PRESETS[0]["phases"][0], t=0.01)])
+    _sc52, _tot52b = scenario_build_raw("/tmp/opencode/rs520_preset.raw", _php0, _par52m, 8e6, seed=3)
+    _ok527 = _ok527 and os.path.getsize(_sc52) == 2 * _tot52b and _tot52b == 80000
+    print("ГОТОВІ-СЦЕНАРІЇ v5.2.0: %s (%d пресети, %d відл.)"
+          % ("PASS" if _ok527 else "FAIL", len(SCENARIO_PRESETS), _tot52b))
+    ok = ok and _ok527
+
+    # --- ТЕСТ БАТЧ-АНАЛІЗУ (v5.2.0) ---
+    _bd52 = "/tmp/opencode/rs520_batch"
+    os.makedirs(_bd52, exist_ok=True)
+    for _bn52, _bf52 in (("b1.raw", _abA), ("b2.raw", _abB)):
+        with open(os.path.join(_bd52, _bn52), "wb") as _fh52:
+            _fh52.write(open(_bf52, "rb").read())
+    _rows52 = batch_scan(_bd52, 8e6)
+    _csv52 = batch_save_csv("/tmp/opencode/rs520_batch.csv", _rows52)
+    _ok528 = (len(_rows52) == 2 and abs(_rows52[0]["f_hz"] - 600e3) < 4e3
+              and os.path.getsize(_csv52) > 100
+              and "b1.raw" in open(_csv52, encoding="utf-8-sig").read())
+    print("БАТЧ v5.2.0: %s (%d файлів, CSV %.0f Б)"
+          % ("PASS" if _ok528 else "FAIL", len(_rows52), os.path.getsize(_csv52)))
+    ok = ok and _ok528
+
+    # --- ТЕСТ 3D У ЗВІТІ PDF (v5.3.0) ---
+    _pdf53 = "/tmp/opencode/rs530_report.pdf"
+    _s53 = render_spec3d_png("/tmp/opencode/rs53_spec3d.png", _raw52, 8e6)
+    _m53 = render_map3d_png("/tmp/opencode/rs53_map3d.png", 50.0, -85.0, 2.4e9)
+    _v53 = render_vs3d_png("/tmp/opencode/rs53_vs3d.png", _abA, 8e6,
+                           jam_f_hz=600e3, jam_bw_hz=2e6, js_db=15.0)
+    build_pdf_report(_pdf53,
+                     [{"enabled": True, "kind": "Завада (шум)", "freq": 2.4e9,
+                       "phase": 0.0, "amp": 12000.0, "width_us": 2.0,
+                       "dc": 32768.0, "gain": 1.0}],
+                     metric=_m51,
+                     spec3d={"raw_path": _raw52, "fs_hz": 8e6},
+                     map3d={"eirp_dbm": 50.0, "thresh_dbm": -85.0, "f_hz": 2.4e9},
+                     vs3d={"raw_path": _abA, "fs_hz": 8e6, "jam_f_hz": 600e3,
+                           "jam_bw_hz": 2e6, "js_db": 15.0})
+    from pypdf import PdfReader as _PR53
+    _np53 = len(_PR53(_pdf53).pages)
+    _ok530 = (os.path.exists(_pdf53) and os.path.getsize(_pdf53) > 20000 and _np53 >= 3
+              and _s53 and _m53 and _v53
+              and os.path.getsize("/tmp/opencode/rs53_spec3d.png") > 8000
+              and os.path.getsize("/tmp/opencode/rs53_map3d.png") > 8000
+              and os.path.getsize("/tmp/opencode/rs53_vs3d.png") > 8000)
+    print("3D-PDF v5.3.0: %s (%d стор., %.0f КБ)"
+          % ("PASS" if _ok530 else "FAIL", _np53, os.path.getsize(_pdf53) / 1024.0))
+    ok = ok and _ok530
+
+    # --- ТЕСТ МОДУЛЯ ОВ-ДРОНУ (v5.4.0) ---
+    _ok540 = (len(FIBER_MODEMS) >= 8 and len(FIBER_CLOCKS) >= 6 and all(
+        all(k in m for k in ("name", "lam_nm", "rate_mbps", "reach_km", "laser",
+                             "p_tx_dbm", "sens_dbm", "overload_dbm", "clock_mhz"))
+        for m in FIBER_MODEMS))
+    _bl540 = fiber_bleach(10.0, 10.0, 1.0)
+    _bn540 = fiber_bleach_needed(1.0, -3.0, 10.0)
+    _st540 = fiber_status(-3.0, -26.0, -3.0)
+    _st541 = fiber_status(-40.0, -26.0, -3.0)
+    _rs540 = mcu_resonance(25e6, 1.0)
+    _csv540 = fiber_modems_csv("/tmp/opencode/rs540_fiber.csv")
+    _g54 = 20.0 * math.log10(10000.0 / 9.0)
+    _ok540 = (_ok540
+              and abs(_bl540["spot_um"] - 10000.0) < 1e-6
+              and abs(_bl540["geom_db"] - _g54) < 1e-6
+              and abs(_bl540["p_rx_dbm"] - (10.0 - 2.0 - _g54)) < 1e-6
+              and abs(_bn540 - (-3.0 + 2.0 + _g54)) < 1e-6
+              and _st540[0] == 2 and _st541[0] == 0
+              and abs(_rs540["e_req_vm"] - 5.0) < 1e-9
+              and abs(_rs540["eirp_dbm"] - 10.0 * math.log10((5.0 ** 2 / 30.0) * 1000.0)) < 1e-9
+              and os.path.getsize(_csv540) > 300)
+    print("ОВ-ДРОН v5.4.0: %s (%d модемів, потрібно %.1f дБм на 1 м, EIRP %.1f дБм)"
+          % ("PASS" if _ok540 else "FAIL", len(FIBER_MODEMS), _bn540, _rs540["eirp_dbm"]))
+    ok = ok and _ok540
 
     print("ПІДСУМОК:", "PASS" if ok else "FAIL")
     return 0 if ok else 1
